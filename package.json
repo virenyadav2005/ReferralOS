@@ -1,0 +1,27 @@
+{
+  "name": "referralos",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n API,WEB -c cyan,magenta \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "node --watch --env-file-if-exists=.env apps/api/src/server.js",
+    "dev:web": "npm run dev -w @referralos/web",
+    "db:migrate": "node --env-file-if-exists=.env apps/api/src/scripts/migrate.js",
+    "db:seed": "node --env-file-if-exists=.env apps/api/src/scripts/seed.js",
+    "admin:grant": "node --env-file-if-exists=.env apps/api/src/scripts/grant-admin.js",
+    "build": "npm run build -w @referralos/web",
+    "test": "npm run test -w @referralos/api",
+    "start": "node --env-file-if-exists=.env apps/api/src/server.js"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}

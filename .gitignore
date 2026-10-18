@@ -1,0 +1,29 @@
+node_modules/
+dist/
+.env
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/private-resumes/
+data/private-job-imports/
+uploads/
+npm-debug.log*
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Local dependencies and build output
+node_modules/
+dist/
+
+# Local database and private uploads
+data/
+uploads/
+
+# Logs
+npm-debug.log*
+
+# Generated TypeScript build metadata
+*.tsbuildinfo
