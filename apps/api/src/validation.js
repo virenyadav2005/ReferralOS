@@ -82,6 +82,10 @@ export const referralSchema = z.object({
   useSavedResume: z.preprocess((value) => value === true || value === 'true', z.boolean()).optional(),
 });
 export const completionSchema = z.object({ applicationId: z.string().trim().max(120).optional(), note: z.string().trim().max(1200).optional() });
+export const workflowStepReviewSchema = z.object({
+  action: z.enum(['approve', 'request_information', 'return_for_changes']),
+  response: z.string().trim().min(4).max(1200),
+});
 export const statusSchema = z.object({ status: z.enum(['accepted','declined','candidate_action_needed','employee_action_needed','referral_confirmed','candidate_reported_applied','withdrawn','closed']), note: z.string().trim().max(1200).optional(), confirmEmployerSubmission: z.boolean().optional() }).superRefine((value, ctx) => {
   if (value.status === 'referral_confirmed' && (!value.confirmEmployerSubmission || !value.note?.trim())) {
     ctx.addIssue({ code: 'custom', path: ['confirmEmployerSubmission'], message: 'Confirm that you completed the referral through an authorized employer process and add a note.' });
