@@ -201,6 +201,13 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
     const jobPayload={companyId:employeeAffiliation.company_id,title:'Senior Product Engineer',description:'Fictional position used to exercise job search and referral workflow APIs.',location:'Remote',locationType:'remote',experienceLevel:'mid',employmentType:'full_time',skills:['TypeScript'],salaryRange:'',sourceUrl:'',workflowTemplate:'request_employee',expiresAt:new Date(Date.now()+86400000).toISOString(),steps:[
       {stepNumber:1,title:'Request a referral',instructions:'Send the employee a brief note about your interest in the role.',responsible:'candidate',actionType:'request_referral',destinationUrl:'',destinationEmail:'',requiresApplicationId:false,completionMethod:'manual_employee'},
       {stepNumber:2,title:'Open the sample application',instructions:'Review this fictional external application instruction.',responsible:'candidate',actionType:'apply_external',destinationUrl:'https://careers.example/demo',destinationEmail:'',requiresApplicationId:false,completionMethod:'external_unverified'}]};
+    const missingRequiredJob=await employee.call('/jobs',{method:'POST',body:{...jobPayload,title:'X',description:'Too short'}});
+    assert.equal(missingRequiredJob.status,400);
+    assert.ok(missingRequiredJob.data.details.some((item)=>item.field==='title'));
+    assert.ok(missingRequiredJob.data.details.some((item)=>item.field==='description'));
+    const invalidWorkflowJob=await employee.call('/jobs',{method:'POST',body:{...jobPayload,title:'Missing workflow destination',steps:jobPayload.steps.map((step,index)=>index===1?{...step,destinationUrl:''}:step)}});
+    assert.equal(invalidWorkflowJob.status,400);
+    assert.ok(invalidWorkflowJob.data.details.some((item)=>item.field==='steps.1.destinationUrl'));
     const referrerJobPayload={...jobPayload,title:'Another Referrer Published Role'};
     const referrerJob=await referrerWithoutWorkEmail.call('/jobs',{method:'POST',body:referrerJobPayload});
     assert.equal(referrerJob.status,201,'referrer without work-email verification can publish a job');
