@@ -8,7 +8,7 @@ import multer from 'multer';
 import { audit, id, notify } from './ids.js';
 import { createEmailProvider } from './email.js';
 import { attachUser, clearSessionCookie, createCsrfToken, createSession, csrfGuard, hashPassword, requireAuth, requireRole, verifyPassword } from './security.js';
-import { completionSchema, contactReviewSchema, contactSchema, jobImportDraftSchema, jobImportExtractSchema, jobImportImageOrderSchema, jobImportPublishSchema, jobSchema, jobStatusSchema, loginSchema, parseBody, profileSchema, referralSchema, registerSchema, reportReviewSchema, reportSchema, requestMessageSchema, resumeConsentSchema, statusSchema, verificationReviewSchema, workEmailSchema, workEmailTokenSchema } from './validation.js';
+import { completionSchema, contactReviewSchema, contactSchema, jobImportDraftSchema, jobImportExtractSchema, jobImportImageOrderSchema, jobImportPublishSchema, jobSchema, jobStatusSchema, loginSchema, parseBody, profileSchema, referralSchema, registerSchema, reportReviewSchema, reportSchema, requestMessageSchema, resumeConsentSchema, statusSchema, verificationReviewSchema, workflowStepReviewSchema, workEmailSchema, workEmailTokenSchema } from './validation.js';
 import { createScreenshotExtractor } from './screenshot-extraction.js';
 
 const templateNames = {
@@ -400,17 +400,18 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
       for (const step of steps) { step.destinationUrl = null; step.destinationEmail = null; }
     }
     const saved = Boolean(req.user?.roles.includes('candidate') && db.prepare('SELECT 1 FROM bookmarks WHERE user_id=? AND job_id=?').get(req.user.id, row.id));
-    const completions = req.user ? db.prepare('SELECT step_id FROM workflow_step_completions WHERE job_id=? AND user_id=?').all(row.id, req.user.id).map((item) => item.step_id) : [];
+    const userProgress = req.user ? db.prepare('SELECT step_id,completion_state,review_status,employee_response,request_id FROM workflow_step_completions WHERE job_id=? AND user_id=?').all(row.id, req.user.id) : [];
+    const completions = userProgress.map((item) => item.step_id);
     const canRequest = row.workflow_template === 'request_employee' || steps.some((step) => step.actionType === 'request_referral');
     const referralRequest = req.user?.roles.some((role) => role === 'candidate' || role === 'employee') ? db.prepare(`SELECT id,status,created_at,updated_at FROM referral_requests WHERE job_id=? AND candidate_id=?`).get(row.id, req.user.id) ?? null : null;
     const posterAffiliation = db.prepare(`SELECT work_email_verified_at FROM employee_affiliations WHERE user_id=? AND company_id=? ORDER BY created_at LIMIT 1`).get(row.poster_user_id, row.company_id);
-    return res.json({ job: safeJob(row, saved), steps, completedStepIds: completions, canRequest, referralRequest, isOwnJob: req.user?.id === row.poster_user_id,
+    return res.json({ job: safeJob(row, saved), steps, completedStepIds: completions, stepProgress:userProgress.map((item)=>({stepId:item.step_id,status:item.completion_state==='employee_confirmed'?'employee_confirmed':item.review_status,response:item.employee_response,requestId:item.request_id})), canRequest, referralRequest, isOwnJob: req.user?.id === row.poster_user_id,
       employeeWorkEmailVerified: Boolean(posterAffiliation?.work_email_verified_at),
       workflowNotice: 'Instructions and contact details are provided by the employee who posted this listing. ReferralOS does not verify or submit applications to employer systems.' });
   });
 
   app.post('/api/jobs/:jobId/steps/:stepId/completion', requireAuth, parseBody(completionSchema), (req, res) => {
-    const step = db.prepare(`SELECT s.id,s.job_id,s.responsible,s.completion_method,s.action_type,j.posted_by,j.is_demo
+    const step = db.prepare(`SELECT s.id,s.job_id,s.title,s.responsible,s.completion_method,s.action_type,j.posted_by,j.is_demo
       FROM job_workflow_steps s JOIN jobs j ON j.id=s.job_id WHERE s.id=? AND s.job_id=? AND j.status='published'
       AND j.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`).get(req.params.stepId, req.params.jobId);
     if (!step) return res.status(404).json({ error: 'Workflow step not found.' });
@@ -420,13 +421,46 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     const employeeMayRecord = req.user.roles.includes('employee') && req.user.id === step.posted_by && ['employee','either'].includes(step.responsible);
     if (!candidateMayRecord && !employeeMayRecord) return res.status(403).json({ error: 'You cannot record progress for this step.' });
     const state = candidateMayRecord ? 'candidate_reported' : 'employee_confirmed';
-    db.prepare(`INSERT INTO workflow_step_completions(id,job_id,step_id,user_id,completion_state,application_id,note)
-      VALUES (?,?,?,?,?,?,?) ON CONFLICT(step_id,user_id) DO UPDATE SET completion_state=excluded.completion_state,
-      application_id=excluded.application_id,note=excluded.note`).run(id(), step.job_id, step.id, req.user.id, state,
-      req.validatedBody.applicationId || null, req.validatedBody.note || null);
-    if (candidateMayRecord && !step.is_demo && step.posted_by !== req.user.id) notify(db, step.posted_by, 'workflow_progress', 'Candidate updated workflow progress', `${req.user.displayName} reported progress on a workflow step.`, '/employee');
-    audit(db, req.user.id, 'workflow.step_reported', 'workflow_step', step.id, { state });
-    res.json({ stepId: step.id, state, message: 'Progress recorded as a user report. ReferralOS cannot verify external actions.' });
+    if (candidateMayRecord) {
+      const request = db.prepare(`SELECT r.id,r.employee_id,j.title job_title FROM referral_requests r JOIN jobs j ON j.id=r.job_id
+        WHERE r.job_id=? AND r.candidate_id=? AND r.employee_id=? AND r.status NOT IN ('closed','declined','withdrawn','expired')`).get(step.job_id, req.user.id, step.posted_by);
+      if (!request) return res.status(409).json({ error: 'Submit a referral request for this job before reporting workflow progress.' });
+      const existing = db.prepare('SELECT id,request_id,review_status FROM workflow_step_completions WHERE step_id=? AND user_id=?').get(step.id, req.user.id);
+      if (existing?.request_id && (existing.request_id !== request.id || existing.review_status !== 'changes_requested')) return res.status(409).json({ error: 'This workflow step is already awaiting review or has been approved.' });
+      const completionId = existing?.id ?? id();
+      let wasResubmission = false;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const currentRequest = db.prepare(`SELECT r.id,r.status FROM referral_requests r JOIN jobs j ON j.id=r.job_id
+          WHERE r.id=? AND r.job_id=? AND r.candidate_id=? AND j.status='published' AND j.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`).get(request.id, step.job_id, req.user.id);
+        if (!currentRequest || ['closed','declined','withdrawn','expired'].includes(currentRequest.status)) { db.exec('ROLLBACK'); return res.status(409).json({ error: 'This referral request is no longer open for workflow updates.' }); }
+        const latest = db.prepare('SELECT id,request_id,review_status FROM workflow_step_completions WHERE step_id=? AND user_id=?').get(step.id, req.user.id);
+        if (latest?.request_id && (latest.request_id !== request.id || latest.review_status !== 'changes_requested')) { db.exec('ROLLBACK'); return res.status(409).json({ error: 'This workflow step is already awaiting review or has been approved.' }); }
+        wasResubmission = Boolean(latest?.request_id);
+        const submittedAt = new Date().toISOString();
+        if (latest?.request_id) db.prepare(`UPDATE workflow_step_completions SET completion_state='candidate_reported',application_id=?,note=?,review_status='resubmitted',employee_response=NULL,reviewed_by=NULL,reviewed_at=NULL,updated_at=?,submitted_at=? WHERE id=? AND request_id=? AND review_status='changes_requested'`)
+          .run(req.validatedBody.applicationId || null, req.validatedBody.note || null, submittedAt, submittedAt, latest.id, request.id);
+        else if (latest) db.prepare(`UPDATE workflow_step_completions SET request_id=?,completion_state='candidate_reported',application_id=?,note=?,review_status='pending_review',employee_response=NULL,reviewed_by=NULL,reviewed_at=NULL,updated_at=?,submitted_at=? WHERE id=? AND request_id IS NULL`)
+          .run(request.id, req.validatedBody.applicationId || null, req.validatedBody.note || null, submittedAt, submittedAt, latest.id);
+        else db.prepare(`INSERT INTO workflow_step_completions(id,job_id,step_id,user_id,completion_state,application_id,note,request_id,review_status,created_at,updated_at,submitted_at)
+          VALUES (?,?,?,?,?,?,?,?,'pending_review',?,?,?)`).run(completionId, step.job_id, step.id, req.user.id, state,
+          req.validatedBody.applicationId || null, req.validatedBody.note || null, request.id, submittedAt, submittedAt, submittedAt);
+        const action = wasResubmission ? 'resubmitted' : 'submitted';
+        db.prepare(`INSERT INTO workflow_step_review_history(id,completion_id,request_id,step_id,actor_id,action,status,submitted_information,created_at)
+          VALUES (?,?,?,?,?,?,?,?,?)`).run(id(), completionId, request.id, step.id, req.user.id, action, wasResubmission ? 'resubmitted' : 'pending_review', req.validatedBody.note || null, submittedAt);
+        notify(db, request.employee_id, 'workflow_progress', 'Workflow step needs review', `${req.user.displayName} submitted “${step.title}” for ${request.job_title} at ${submittedAt}.${req.validatedBody.note ? ` Details: ${req.validatedBody.note}` : ''}`, `/referral-requests/${request.id}?workflowStep=${step.id}`);
+        audit(db, req.user.id, wasResubmission ? 'workflow.step_resubmitted' : 'workflow.step_submitted', 'workflow_step_completion', completionId, { requestId: request.id, stepId: step.id });
+        db.exec('COMMIT');
+      } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; }
+      return res.status(201).json({ stepId: step.id, requestId: request.id, state: wasResubmission ? 'resubmitted' : 'pending_review', message: 'Progress sent to the employee for review. ReferralOS cannot verify external actions.' });
+    }
+    const confirmedAt = new Date().toISOString();
+    db.prepare(`INSERT INTO workflow_step_completions(id,job_id,step_id,user_id,completion_state,application_id,note,review_status,created_at,updated_at,submitted_at)
+      VALUES (?,?,?,?,?,?,?,'approved',?,?,?) ON CONFLICT(step_id,user_id) DO UPDATE SET completion_state=excluded.completion_state,
+      application_id=excluded.application_id,note=excluded.note,review_status='approved',updated_at=excluded.updated_at,submitted_at=excluded.submitted_at`).run(id(), step.job_id, step.id, req.user.id, state,
+      req.validatedBody.applicationId || null, req.validatedBody.note || null, confirmedAt, confirmedAt, confirmedAt);
+    audit(db, req.user.id, 'workflow.step_confirmed', 'workflow_step', step.id, { state });
+    res.json({ stepId: step.id, state, message: 'Progress recorded as an employee action. ReferralOS cannot verify external actions.' });
   });
 
   app.get('/api/companies', (_req, res) => {
@@ -746,11 +780,51 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     if (!isCandidate && !isEmployee) return res.status(404).json({ error: 'Referral request not found.' });
     const history = db.prepare(`SELECT h.id,h.actor_id,h.from_status,h.to_status,h.note,h.created_at,p.display_name actor_name
       FROM referral_status_history h LEFT JOIN profiles p ON p.user_id=h.actor_id WHERE h.request_id=? ORDER BY h.created_at,h.id`).all(request.id);
+    const workflowProgress = db.prepare(`SELECT s.id step_id,s.step_number,s.title step_title,s.instructions,s.responsible,s.action_type,
+      wc.id completion_id,wc.user_id candidate_id,wc.completion_state,wc.review_status,wc.application_id,wc.note submitted_information,
+      wc.employee_response,wc.submitted_at,wc.updated_at,p.display_name candidate_name,
+      (SELECT json_group_array(json_object('id',wh.id,'action',wh.action,'status',wh.status,'submittedInformation',wh.submitted_information,
+        'employeeResponse',wh.employee_response,'actorName',hp.display_name,'createdAt',wh.created_at))
+       FROM workflow_step_review_history wh LEFT JOIN profiles hp ON hp.user_id=wh.actor_id
+       WHERE wh.request_id=? AND wh.step_id=s.id ORDER BY wh.created_at,wh.rowid) review_history
+      FROM job_workflow_steps s LEFT JOIN workflow_step_completions wc ON wc.step_id=s.id AND wc.request_id=?
+      LEFT JOIN profiles p ON p.user_id=wc.user_id WHERE s.job_id=? ORDER BY s.step_number`).all(request.id,request.id,request.job_id)
+      .map((step)=>({...step,review_history:JSON.parse(step.review_history||'[]')}));
     const messages = db.prepare(`SELECT m.id,m.author_id,m.body,m.audience,m.created_at,p.display_name author_name,
       (SELECT mr.read_at FROM referral_message_reads mr WHERE mr.message_id=m.id AND mr.user_id=?) read_at FROM referral_request_messages m
       LEFT JOIN profiles p ON p.user_id=m.author_id WHERE m.request_id=? AND (m.audience='participants' OR ?=1) ORDER BY m.created_at,m.id`).all(req.user.id,request.id, Number(isEmployee));
     const nextAction = ({ pending:'Awaiting employee response', accepted:'Employee action required', declined:'No further action · resubmission allowed', candidate_action_needed:'Your response is required', employee_action_needed:'Employee action required', referral_confirmed:'Employee reported referral submission · not independently verified', candidate_reported_applied:'Candidate reported application · not independently verified', withdrawn:'Closed by candidate · resubmission allowed', closed:'Closed · resubmission allowed', expired:'Expired · resubmission allowed' })[request.status] ?? request.status;
-    res.json({ request: { ...request, employee_work_email_verified:Boolean(request.employee_work_email_verified_at), nextAction, viewer:isCandidate?'candidate':'employee' }, history, messages });
+    res.json({ request: { ...request, employee_work_email_verified:Boolean(request.employee_work_email_verified_at), nextAction, viewer:isCandidate?'candidate':'employee' }, history, messages, workflowProgress });
+  });
+
+  app.patch('/api/referral-requests/:requestId/workflow-steps/:stepId/review', requireRole('employee'), parseBody(workflowStepReviewSchema), (req, res) => {
+    const request = db.prepare(`SELECT r.id,r.job_id,r.candidate_id,r.employee_id,r.status,j.title job_title,p.display_name candidate_name
+      FROM referral_requests r JOIN jobs j ON j.id=r.job_id JOIN profiles p ON p.user_id=r.candidate_id WHERE r.id=?`).get(req.params.requestId);
+    if (!request || request.employee_id !== req.user.id) return res.status(404).json({ error: 'Referral request not found.' });
+    if (['closed','declined','withdrawn','expired'].includes(request.status)) return res.status(409).json({ error: 'This referral request is closed and cannot receive workflow decisions.' });
+    const step = db.prepare(`SELECT s.id,s.title FROM job_workflow_steps s WHERE s.id=? AND s.job_id=?`).get(req.params.stepId, request.job_id);
+    if (!step) return res.status(404).json({ error: 'Workflow step not found for this referral request.' });
+    const completion = db.prepare(`SELECT id,review_status FROM workflow_step_completions WHERE request_id=? AND step_id=? AND user_id=?`).get(request.id, step.id, request.candidate_id);
+    if (!completion) return res.status(404).json({ error: 'No candidate update exists for this workflow step.' });
+    const allowed = ['pending_review','resubmitted'];
+    if (!allowed.includes(completion.review_status)) return res.status(409).json({ error: 'This workflow update has already been reviewed or is awaiting candidate changes.' });
+    const nextStatus = req.validatedBody.action === 'approve' ? 'approved' : 'changes_requested';
+    const now = new Date().toISOString();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const currentRequest = db.prepare('SELECT status FROM referral_requests WHERE id=? AND employee_id=?').get(request.id, req.user.id);
+      if (!currentRequest || ['closed','declined','withdrawn','expired'].includes(currentRequest.status)) { db.exec('ROLLBACK'); return res.status(409).json({ error: 'This referral request is closed and cannot receive workflow decisions.' }); }
+      const updated = db.prepare(`UPDATE workflow_step_completions SET review_status=?,employee_response=?,reviewed_by=?,reviewed_at=?,updated_at=?
+        WHERE id=? AND request_id=? AND review_status IN ('pending_review','resubmitted')`).run(nextStatus, req.validatedBody.response, req.user.id, now, now, completion.id, request.id);
+      if (!updated.changes) { db.exec('ROLLBACK'); return res.status(409).json({ error: 'This workflow update has already been reviewed.' }); }
+      db.prepare(`INSERT INTO workflow_step_review_history(id,completion_id,request_id,step_id,actor_id,action,status,employee_response,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)`).run(id(), completion.id, request.id, step.id, req.user.id, nextStatus, nextStatus, req.validatedBody.response, now);
+      const title = nextStatus === 'approved' ? 'Workflow step approved' : 'Changes requested on a workflow step';
+      notify(db, request.candidate_id, 'workflow_review', title, `${request.job_title} · ${step.title}: ${req.validatedBody.response}`, `/referral-requests/${request.id}?workflowStep=${step.id}`);
+      audit(db, req.user.id, `workflow.step_${nextStatus}`, 'workflow_step_completion', completion.id, { requestId: request.id, stepId: step.id });
+      db.exec('COMMIT');
+    } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; }
+    return res.json({ requestId: request.id, stepId: step.id, status: nextStatus });
   });
 
   const referralMessageLimiter = rateLimit({windowMs:60*60*1000,limit:40,standardHeaders:true,legacyHeaders:false,message:{error:'Too many messages for now. Please try again later.'}});
