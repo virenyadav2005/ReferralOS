@@ -92,7 +92,7 @@ test('demo seed is idempotent and remains clearly fictional', (t) => {
   try{assert.equal(db.prepare('SELECT COUNT(*) count FROM jobs WHERE is_demo=1').get().count,6);assert.equal(db.prepare("SELECT COUNT(*) count FROM users WHERE email='demo-poster@referralos.example' AND disabled_at IS NOT NULL").get().count,1);assert.equal(db.prepare("SELECT COUNT(*) count FROM jobs WHERE description LIKE 'DEMO DATA — fictional example listing.%'").get().count,6);}finally{closeDatabase(db);}
 });
 
-test('OCR.space adapter sends multipart requests and preserves recognized text as unverified evidence',async()=>{
+test('OCR.space adapter sends multipart requests and preserves raw text without inventing a description',async()=>{
   const base={nodeEnv:'test',screenshotOcrUrl:'https://api.ocr.space/parse/image',screenshotOcrApiKey:'test-only'};
   let request;
   const extractor=createScreenshotExtractor(base,{fetchImpl:async(url,options)=>{request={url,options};return{ok:true,status:200,json:async()=>({OCRExitCode:1,IsErroredOnProcessing:false,ParsedResults:[{ParsedText:'Senior Engineer\\nRemote · TypeScript'}]})};}});
@@ -101,7 +101,7 @@ test('OCR.space adapter sends multipart requests and preserves recognized text a
   assert.equal(request.options.method,'POST');assert.equal(request.options.headers.apikey,'test-only');assert.equal(request.options.headers.authorization,undefined);
   assert.ok(request.options.body instanceof FormData);assert.equal(request.options.body.get('language'),'eng');assert.equal(request.options.body.get('isOverlayRequired'),'false');
   assert.equal(request.options.body.get('file').name,'screenshot.png');assert.equal(result.provider,'ocr.space');
-  assert.equal(result.fields.description.value,'Senior Engineer\\nRemote · TypeScript');assert.equal(result.fields.description.uncertain,true);assert.equal(result.fields.title.value,null);
+  assert.equal(result.rawText,'Senior Engineer\\nRemote · TypeScript');assert.equal(result.fields.description.value,null);assert.equal(result.fields.title.value,null);
 });
 
 test('OCR.space adapter categorizes failures without echoing provider content or credentials',async()=>{

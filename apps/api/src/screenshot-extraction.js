@@ -1,4 +1,4 @@
-const fieldNames = ['title','companyName','location','experience','employmentType','workArrangement','skills','qualifications','description','requisitionId','salaryRange','applicationUrl','referralUrl','referralInstructions','deadline'];
+import { parseJobPostingText } from './job-text-parser.js';
 
 export class ScreenshotExtractionError extends Error {
   constructor(category, httpStatus = null) {
@@ -53,16 +53,10 @@ export function createScreenshotExtractor(config, { fetchImpl = fetch } = {}) {
         recognized.push(text);
       }
 
-      // OCR.space transcribes text; it does not reliably map text to fields.
-      // Keep the result as reviewable evidence and never infer missing values.
+      // OCR.space provides recognized text only. Parse labeled values locally,
+      // retain the complete evidence, and leave absent or conflicting fields blank.
       const combinedText = recognized.join('\n\n--- Screenshot ---\n\n').slice(0, 8000);
-      const fields = Object.fromEntries(fieldNames.map((name) => [name, {
-        value: name === 'description' ? combinedText : null,
-        confidence: 0,
-        sourceText: name === 'description' ? combinedText.slice(0, 1000) : null,
-        uncertain: true,
-      }]));
-      return { fields, provider: 'ocr.space' };
+      return { ...parseJobPostingText(combinedText), provider: 'ocr.space' };
     },
   };
 }
