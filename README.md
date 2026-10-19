@@ -61,6 +61,7 @@ Tests use temporary SQLite files and Node's built-in test runner. The app itself
 | Variable | Default | Purpose |
 |---|---|---|
 | `NODE_ENV` | `development` | Set `production` to enable secure-only session cookies. |
+| `DEMO_MODE` | `false` | Set `true` for the public read-only pilot. Browsing and sign-in remain available; account registration, applications, referrals, messages, profile updates, job changes, imports/OCR, reports, and private file access are blocked. |
 | `PORT` | `4000` | Express API port. |
 | `HOST` | `127.0.0.1` in development; `0.0.0.0` in production | Interface to bind the API listener to. Set to the platform-required bind address when deploying. |
 | `APP_ORIGINS` | `http://127.0.0.1:5173` | Comma-separated exact browser origins allowed for cookie-authenticated writes. `APP_ORIGIN` remains supported as a single-origin compatibility setting. |
@@ -75,10 +76,16 @@ Tests use temporary SQLite files and Node's built-in test runner. The app itself
 | `EMAIL_PROVIDER` | `console` in development; unconfigured in production | `console` creates a local authenticated link preview. Production supports `resend` and never falls back to console. |
 | `EMAIL_FROM` | Unset | Verified sender address for Resend. |
 | `RESEND_API_KEY` | Unset | Secret Resend API key; configure only in deployment secrets. |
-| `SCREENSHOT_OCR_URL` | Unset | Optional trusted OCR endpoint. Production must use HTTPS. |
-| `SCREENSHOT_OCR_API_KEY` | Unset | Optional OCR endpoint secret; server-side only. |
+| `SCREENSHOT_OCR_URL` | Unset | OCR.space image endpoint, normally `https://api.ocr.space/parse/image`. Production must use HTTPS. |
+| `SCREENSHOT_OCR_API_KEY` | Unset | OCR.space key, sent only in the server-side `apikey` header. |
 
 The frontend build is emitted to `apps/web/dist`. The Express app serves that directory if present, so production can run `npm run build` followed by `npm start`. Configure a persistent disk for both SQLite and private resumes before hosting; production multi-instance deployments should move to managed PostgreSQL and private object storage.
+
+### Public read-only pilot
+
+Set `DEMO_MODE=true` on the server before starting it. The API remains protected by the same exact-origin validation, CSRF checks, authentication, authorization, and rate limits. The central demo guard rejects state-changing API requests, including screenshot extraction, and blocks private resume/import files and account-specific data. Login and logout remain enabled; registration is unavailable. Turn the pilot off by setting `DEMO_MODE=false` or removing the variable and restarting the service. Do not use demo mode as a substitute for configuring production email or storage.
+
+`GET /api/health` is a liveness check and confirms only that the HTTP process responds. `GET /api/ready` performs a minimal SQLite `SELECT 1`; it returns `{ "status": "ready" }` on success or a generic 503 `{ "status": "unavailable" }` on failure. The endpoint does not return paths or database errors.
 
 ## Security and integration boundaries
 
@@ -93,7 +100,7 @@ The frontend build is emitted to `apps/web/dist`. The Express app serves that di
 - Set `NODE_ENV=production`, exact `APP_ORIGINS`, `PUBLIC_APP_URL`, `EMAIL_PROVIDER=resend`, `EMAIL_FROM`, and `RESEND_API_KEY` in hosting configuration.
 - Build with `npm run build`; run `npm run db:migrate` before `npm start`.
 - Mount durable private storage for `DATABASE_PATH` and `RESUME_STORAGE_DIR`. Back up SQLite regularly; do not place private resumes under the static web root.
-- Terminate TLS at the host or reverse proxy so Secure cookies work. Configure health checks and log redaction; never log request bodies or verification URLs.
+- Terminate TLS at the host or reverse proxy so Secure cookies work. Use `/api/health` for liveness and `/api/ready` for SQLite readiness; never log request bodies or verification URLs.
 - Verify sender-domain setup with Resend, configure the real public base URL, and test mail delivery with a non-production account.
 - Review moderation, retention, incident response, legal policy text, and privacy obligations before public launch. No external deployment has been performed.
 - Move to managed PostgreSQL and private object storage when write volume, multiple app instances, backup/RPO needs, or file volume exceed a single persistent-disk deployment.
@@ -111,5 +118,9 @@ data/        Local SQLite database and private local resumes (ignored by git)
 
 Employee accounts can upload up to five PNG/JPEG images (6 MB each) to a private job draft. The server validates MIME type and image signatures, stores files under JOB_IMPORT_STORAGE_DIR with random names outside the web root, and retains temporary source images for up to 30 days. The server deletes expired source images every six hours and records an audit event. Draft data remains private and is excluded from public search until the employee confirms review and explicitly publishes. Discarding a draft deletes its remaining source images.
 
-No OCR engine is installed or bundled locally. To enable extraction, configure SCREENSHOT_OCR_URL and SCREENSHOT_OCR_API_KEY for a trusted endpoint implementing the JSON contract documented in .env.example. Production endpoints must use HTTPS. Users must explicitly consent before screenshots are sent. Without provider configuration, employees can still build a draft manually; the extraction action returns a clear setup message. OCR output is kept separate from user-edited draft values and is never treated as employer-verified information.
+OCR.space can be used for text transcription by setting SCREENSHOT_OCR_URL to `https://api.ocr.space/parse/image` (or another trusted HTTPS OCR.space endpoint) and SCREENSHOT_OCR_API_KEY on the server. The adapter sends each image as multipart form data with the API key in the `apikey` header. The user must explicitly consent before screenshots leave the server. OCR.space returns recognized text, not structured job fields; ReferralOS places that text in the editable description evidence and leaves other fields empty for review. Provider failures are logged only as a failure category and HTTP status, and the API does not return provider response content or credentials. Extraction remains disabled when either setting is missing, and all OCR calls are blocked when `DEMO_MODE=true`.
+
+### Railway proxy and rate-limit note
+
+The API keeps Express proxy trust disabled; login and registration rate limits therefore use the direct socket/request IP, and do not trust client-supplied `X-Forwarded-For` or `X-Real-IP` headers. Railway documents an `X-Real-IP` request header, but this checkout has not verified through a Railway deployment whether that header is overwritten at the edge and cannot be spoofed by a client. Until that trust boundary is verified with Railway, requests sharing the proxy-facing address may share a rate-limit bucket. Limits are not loosened to compensate.
 

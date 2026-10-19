@@ -134,12 +134,48 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     callback(null,true);
   }});
   app.disable('x-powered-by');
-  app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+  app.set('trust proxy', false);
+  const contentSecurityDirectives = helmet.contentSecurityPolicy.getDefaultDirectives();
+  if (config.nodeEnv !== 'production') delete contentSecurityDirectives['upgrade-insecure-requests'];
+  app.use(helmet({ contentSecurityPolicy: { directives: contentSecurityDirectives }, crossOriginEmbedderPolicy: false }));
+  app.use('/api', (_req, res, next) => { res.setHeader('Cache-Control', 'private, no-store'); next(); });
   app.use(express.json({ limit: '1mb', strict: true }));
   app.use('/api', csrfGuard(config));
-  app.use('/api', attachUser(db));
 
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', service: 'ReferralOS API' }));
+  app.get('/api/ready', (_req, res) => {
+    try {
+      const result = db.prepare('SELECT 1 AS ready').get();
+      if (Number(result?.ready) !== 1) return res.status(503).json({ status: 'unavailable' });
+      return res.json({ status: 'ready' });
+    } catch {
+      return res.status(503).json({ status: 'unavailable' });
+    }
+  });
+  app.get('/api/public-config', (_req, res) => res.json({ demoMode: Boolean(config.demoMode) }));
+  app.use('/api', attachUser(db));
+  app.use('/api', (req, res, next) => {
+    if (!config.demoMode) return next();
+    const method = req.method.toUpperCase();
+    const requestPath = (req.originalUrl ?? req.path).split('?')[0];
+    const safeMethods = ['GET', 'HEAD', 'OPTIONS'];
+    const sessionActions = method === 'POST' && ['/api/auth/login', '/api/auth/logout'].includes(requestPath);
+    if (!safeMethods.includes(method) && !sessionActions) {
+      return res.status(403).json({ error: 'This ReferralOS pilot is read-only. Account creation, submissions, uploads, and changes are disabled.' });
+    }
+    const privatePaths = /^\/api\/profile\/resume\/?$/.test(requestPath)
+      || /^\/api\/referral-requests\/[^/]+\/resume\/?$/.test(requestPath)
+      || /^\/api\/employee\/job-imports\/[^/]+\/images\/[^/]+\/?$/.test(requestPath)
+      || requestPath === '/api/employee/work-email/verification-preview'
+      || requestPath === '/api/candidate/dashboard' || requestPath === '/api/candidate/applications'
+      || requestPath === '/api/employee/dashboard' || requestPath.startsWith('/api/employee/job-imports/')
+      || requestPath.startsWith('/api/admin/') || requestPath.startsWith('/api/notifications')
+      || requestPath.startsWith('/api/referral-requests/') || /^\/api\/jobs\/[^/]+\/manage\/?$/.test(requestPath);
+    if (method === 'GET' && privatePaths) {
+      return res.status(403).json({ error: 'Private account, communication, and file data are unavailable in the read-only pilot.' });
+    }
+    return next();
+  });
   app.post('/api/contact', rateLimit({windowMs:60*60*1000,limit:5,standardHeaders:true,legacyHeaders:false}),parseBody(contactSchema),(req,res)=>{
     const messageId=id();const body=req.validatedBody;
     db.prepare('INSERT INTO contact_messages(id,name,email,topic,body) VALUES (?,?,?,?,?)').run(messageId,body.name,body.email,body.topic,body.body);
@@ -360,6 +396,9 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
       WHERE j.id=? AND ${publicJobWhere}`).get(req.params.jobId);
     if (!row) return res.status(404).json({ error: 'This listing is no longer available.' });
     const steps = db.prepare(`${stepSelect} WHERE job_id=? ORDER BY step_number`).all(row.id).map(parseStep);
+    if (config.demoMode) {
+      for (const step of steps) { step.destinationUrl = null; step.destinationEmail = null; }
+    }
     const saved = Boolean(req.user?.roles.includes('candidate') && db.prepare('SELECT 1 FROM bookmarks WHERE user_id=? AND job_id=?').get(req.user.id, row.id));
     const completions = req.user ? db.prepare('SELECT step_id FROM workflow_step_completions WHERE job_id=? AND user_id=?').all(row.id, req.user.id).map((item) => item.step_id) : [];
     const canRequest = row.workflow_template === 'request_employee' || steps.some((step) => step.actionType === 'request_referral');
@@ -470,7 +509,14 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     if(!screenshotExtractor.configured)return res.status(503).json({error:'Screenshot extraction is not configured. Set SCREENSHOT_OCR_URL and SCREENSHOT_OCR_API_KEY to a trusted OCR endpoint, or continue by entering the visible details manually.'});
     try{const extracted=await screenshotExtractor.extract(images.map(image=>({mimeType:image.mime_type,buffer:readFileSync(path.join(importStorage,image.storage_key))})));const current=JSON.parse(draft.draft_json);const mapped={...current};for(const [key,item] of Object.entries(extracted.fields)){if(!mapped[key]&&item.value)mapped[key]=item.value;}
       db.prepare("UPDATE job_import_drafts SET status='extracted',extracted_json=?,draft_json=?,review_confirmed_at=NULL,external_processing_consent=1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?").run(JSON.stringify(extracted),JSON.stringify(mapped),draft.id);audit(db,req.user.id,'job_import.extracted','job_import_draft',draft.id,{provider:extracted.provider});res.json({extracted,draft:mapped,images:draftImages(draft.id)});
-    }catch(error){if(error.message==='SCREENSHOT_OCR_NOT_CONFIGURED')return res.status(503).json({error:'Screenshot extraction is not configured. Continue manually or configure a trusted OCR endpoint.'});if(error.message==='SCREENSHOT_OCR_INVALID_CONFIGURATION')return res.status(503).json({error:'Screenshot OCR endpoint configuration is invalid.'});return res.status(502).json({error:'The configured screenshot extraction provider failed or returned an invalid response. Your draft and uploaded images are unchanged.'});}
+    }catch(error){
+      const category = ['configuration_missing','configuration_invalid','invalid_request','network_error','http_error','invalid_json','provider_response_error'].includes(error?.category) ? error.category : 'unknown';
+      const httpStatus = Number.isInteger(error?.httpStatus) && error.httpStatus >= 100 && error.httpStatus <= 599 ? error.httpStatus : null;
+      if (category === 'configuration_missing' || error.message === 'SCREENSHOT_OCR_NOT_CONFIGURED') return res.status(503).json({error:'Screenshot extraction is not configured. Set SCREENSHOT_OCR_URL and SCREENSHOT_OCR_API_KEY to enable OCR.space, or continue by entering the visible details manually.'});
+      if (category === 'configuration_invalid' || error.message === 'SCREENSHOT_OCR_INVALID_CONFIGURATION') return res.status(503).json({error:'Screenshot OCR endpoint configuration is invalid.'});
+      console.warn('ReferralOS screenshot OCR failure', { category, httpStatus });
+      return res.status(502).json({error:'The configured screenshot extraction provider failed or returned an invalid response. Your draft and uploaded images are unchanged.'});
+    }
   }));
   app.patch('/api/employee/job-imports/:draftId',requireRole('employee'),parseBody(jobImportDraftSchema),(req,res)=>{
     const draft=loadOwnedDraft(req.params.draftId,req.user.id);if(!draft||['discarded','published'].includes(draft.status))return res.status(404).json({error:'Editable import draft not found.'});
@@ -950,7 +996,9 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     if (error?.type === 'entity.parse.failed') return res.status(400).json({ error: 'Request body must be valid JSON.' });
     if (error instanceof multer.MulterError) return res.status(400).json({ error: error.field==='screenshots' ? error.code==='LIMIT_FILE_SIZE'?'Each screenshot must be 6 MB or smaller.':'Upload no more than five screenshots.' : error.code === 'LIMIT_FILE_SIZE' ? 'Resume must be 5 MB or smaller.' : 'The file upload could not be accepted.' });
     if (error?.message === 'Only PDF resumes up to 5 MB are supported.' || error?.message === 'Upload a PDF, DOC, or DOCX resume up to 5 MB.' || error?.message === 'Upload PNG or JPEG screenshots up to 6 MB each.') return res.status(400).json({ error: error.message });
-    console.error('ReferralOS API error:', error);
+    const errorType = ['Error','TypeError','RangeError','SyntaxError','ReferenceError','MulterError','DatabaseError','SqliteError']
+      .includes(error?.name) ? error.name : 'Error';
+    console.error(`ReferralOS API error (${errorType}).`);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
   });
   return app;

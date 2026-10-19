@@ -1,11 +1,13 @@
 import { Link } from 'react-router-dom';
+import { useAuth } from '../auth';
 import type { Job } from '../types';
 
 const levelLabel: Record<string,string> = { intern:'Internship', entry:'Entry level', mid:'Mid level', senior:'Senior', lead:'Lead', executive:'Executive' };
 export function JobCard({ job, onBookmark, busy = false }: { job: Job; onBookmark?: (job: Job) => void; busy?: boolean }) {
+  const { demoMode } = useAuth();
   return <article className="job-card">
     <div className="job-card-top"><div className="company-avatar">{job.company.name.split(/\s+/).slice(0,2).map((part) => part[0]).join('').toUpperCase()}</div><div className="job-company"><Link to={`/companies/${job.companyId}`}><strong>{job.company.name}</strong></Link><span>{job.company.isDemo ? 'Sample company · demo data' : 'Employee-listed company'}</span></div>
-      {onBookmark && <button className={`bookmark-button ${job.isSaved ? 'is-saved' : ''}`} aria-label={job.isSaved ? 'Remove saved job' : 'Save job'} title={job.isSaved ? 'Remove saved job' : 'Save job'} disabled={busy} onClick={() => onBookmark(job)}>{job.isSaved ? '♥' : '♡'}</button>}
+      {onBookmark && !demoMode && <button className={`bookmark-button ${job.isSaved ? 'is-saved' : ''}`} aria-label={job.isSaved ? 'Remove saved job' : 'Save job'} title={job.isSaved ? 'Remove saved job' : 'Save job'} disabled={busy} onClick={() => onBookmark(job)}>{job.isSaved ? '♥' : '♡'}</button>}
     </div>
     <Link className="job-card-title" to={`/jobs/${job.id}`}>{job.title}</Link>
     <div className="job-meta"><span>⌖ {job.location}</span><span>◷ {levelLabel[job.experienceLevel] ?? job.experienceLevel}</span><span>▣ {job.locationType}</span></div>
