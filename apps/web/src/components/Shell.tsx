@@ -5,7 +5,7 @@ import { useAuth } from '../auth';
 import { api } from '../api';
 
 export function Shell() {
-  const { user, loading, signOut } = useAuth();
+  const { user, loading, demoMode, signOut } = useAuth();
   const navigate = useNavigate();
   const location=useLocation();const [unread,setUnread]=useState(0);
   useEffect(()=>{if(!user){setUnread(0);return;}let active=true;const refresh=()=>{void api<{unread:number}>('/notifications/unread-count').then((r)=>{if(active)setUnread(r.unread);}).catch(()=>{});};refresh();const timer=window.setInterval(refresh,30000);window.addEventListener('referralos:notifications-updated',refresh);return()=>{active=false;window.clearInterval(timer);window.removeEventListener('referralos:notifications-updated',refresh);};},[user?.id,location.pathname]);
@@ -26,6 +26,7 @@ export function Shell() {
         </div>
       </div>
     </header>
+    {demoMode&&<div className="demo-banner pilot-banner" role="status"><span>READ-ONLY PILOT</span><p>Sample listings are fictional. Applications, referrals, uploads, and account changes are disabled.</p></div>}
     <main><Outlet /></main>
     <footer className="footer"><div className="footer-inner"><Link className="brand footer-brand" to="/"><span className="brand-mark">R</span><span>Referral<span className="brand-light">OS</span></span></Link><span>One Platform. Every Referral Path.</span><nav className="footer-links" aria-label="Footer"><Link to="/about">About</Link><Link to="/contact">Contact</Link><Link to="/terms">Terms</Link><Link to="/privacy">Privacy</Link></nav><span className="footer-note">Independent platform · Employee-provided instructions · No employer submissions through ReferralOS.</span></div></footer>
   </div>;

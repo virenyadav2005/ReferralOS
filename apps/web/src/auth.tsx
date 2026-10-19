@@ -2,20 +2,22 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { api, jsonBody } from './api';
 import type { User } from './types';
 
-type AuthContextValue = { user: User | null; loading: boolean; refresh: () => Promise<void>; signOut: () => Promise<void>; setUser: (user: User | null) => void };
+type AuthContextValue = { user: User | null; loading: boolean; demoMode: boolean; refresh: () => Promise<void>; signOut: () => Promise<void>; setUser: (user: User | null) => void };
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [demoMode, setDemoMode] = useState(false);
   const refresh = useCallback(async () => {
     try { const result = await api<{ user: User }>('/auth/me'); setUser(result.user); }
     catch { setUser(null); }
     finally { setLoading(false); }
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { void api<{ demoMode: boolean }>('/public-config').then((result) => setDemoMode(result.demoMode)).catch(() => setDemoMode(false)); }, []);
   const signOut = useCallback(async () => { await api('/auth/logout', { method: 'POST' }); setUser(null); }, []);
-  const value = useMemo(() => ({ user, loading, refresh, signOut, setUser }), [user, loading, refresh, signOut]);
+  const value = useMemo(() => ({ user, loading, demoMode, refresh, signOut, setUser }), [user, loading, demoMode, refresh, signOut]);
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 

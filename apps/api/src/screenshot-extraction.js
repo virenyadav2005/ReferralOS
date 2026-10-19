@@ -1,27 +1,68 @@
 const fieldNames = ['title','companyName','location','experience','employmentType','workArrangement','skills','qualifications','description','requisitionId','salaryRange','applicationUrl','referralUrl','referralInstructions','deadline'];
 
-export function createScreenshotExtractor(config,{fetchImpl=fetch}={}){
+export class ScreenshotExtractionError extends Error {
+  constructor(category, httpStatus = null) {
+    super(`SCREENSHOT_OCR_${category.toUpperCase()}`);
+    this.name = 'ScreenshotExtractionError';
+    this.category = category;
+    this.httpStatus = Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599 ? httpStatus : null;
+  }
+}
+
+function readOcrText(payload) {
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.ParsedResults)) return null;
+  if (payload.IsErroredOnProcessing === true || ![1, 2].includes(Number(payload.OCRExitCode))) return null;
+  const text = payload.ParsedResults.map((result) => typeof result?.ParsedText === 'string' ? result.ParsedText.trim() : '')
+    .filter(Boolean).join('\n\n');
+  return text || null;
+}
+
+export function createScreenshotExtractor(config, { fetchImpl = fetch } = {}) {
+  const configured = Boolean(config.screenshotOcrUrl && config.screenshotOcrApiKey);
   return {
-    configured:Boolean(config.screenshotOcrUrl&&config.screenshotOcrApiKey),
-    async extract(images){
-      if(!config.screenshotOcrUrl||!config.screenshotOcrApiKey)throw new Error('SCREENSHOT_OCR_NOT_CONFIGURED');
+    configured,
+    async extract(images) {
+      if (!config.screenshotOcrUrl || !config.screenshotOcrApiKey) throw new ScreenshotExtractionError('configuration_missing');
       let endpoint;
-      try{endpoint=new URL(config.screenshotOcrUrl);}catch{throw new Error('SCREENSHOT_OCR_INVALID_CONFIGURATION');}
-      if(!['https:','http:'].includes(endpoint.protocol)||(config.nodeEnv==='production'&&endpoint.protocol!=='https:'))throw new Error('SCREENSHOT_OCR_INVALID_CONFIGURATION');
-      let response;
-      try{
-        response=await fetchImpl(endpoint,{method:'POST',headers:{authorization:`Bearer ${config.screenshotOcrApiKey}`,'content-type':'application/json'},body:JSON.stringify({instruction:'Extract only visible job-opening information. Do not infer missing values. Return JSON {fields:{fieldName:{value:string|null,confidence:number,sourceText:string|null}}}. Do not extract personal contact information unrelated to the job.',images:images.map(({mimeType,buffer})=>({mimeType,base64:buffer.toString('base64')}))})});
-      }catch{throw new Error('SCREENSHOT_OCR_PROVIDER_FAILED');}
-      if(!response.ok)throw new Error('SCREENSHOT_OCR_PROVIDER_FAILED');
-      let payload;try{payload=await response.json();}catch{throw new Error('SCREENSHOT_OCR_INVALID_RESPONSE');}
-      if(!payload||!payload.fields||typeof payload.fields!=='object')throw new Error('SCREENSHOT_OCR_INVALID_RESPONSE');
-      const fields={};
-      for(const name of fieldNames){const item=payload.fields[name];if(!item||typeof item!=='object') {fields[name]={value:null,confidence:0,sourceText:null,uncertain:true};continue;}
-        const value=typeof item.value==='string'?item.value.slice(0,8000):null;
-        const confidence=Number.isFinite(item.confidence)?Math.min(1,Math.max(0,Number(item.confidence))):0;
-        fields[name]={value,confidence,sourceText:typeof item.sourceText==='string'?item.sourceText.slice(0,1000):null,uncertain:confidence<0.75||!value};
+      try { endpoint = new URL(config.screenshotOcrUrl); }
+      catch { throw new ScreenshotExtractionError('configuration_invalid'); }
+      if (!['https:', 'http:'].includes(endpoint.protocol) || (config.nodeEnv === 'production' && endpoint.protocol !== 'https:')) {
+        throw new ScreenshotExtractionError('configuration_invalid');
       }
-      return {fields,provider:'configured-ocr'};
+      if (!Array.isArray(images) || images.length === 0) throw new ScreenshotExtractionError('invalid_request');
+
+      const recognized = [];
+      for (const image of images) {
+        const form = new FormData();
+        form.set('language', 'eng');
+        form.set('isOverlayRequired', 'false');
+        const extension = image.mimeType === 'image/png' ? 'png' : 'jpg';
+        form.set('file', new Blob([image.buffer], { type: image.mimeType }), `screenshot.${extension}`);
+        let response;
+        try {
+          response = await fetchImpl(endpoint, { method: 'POST', headers: { apikey: config.screenshotOcrApiKey }, body: form });
+        } catch {
+          throw new ScreenshotExtractionError('network_error');
+        }
+        if (!response?.ok) throw new ScreenshotExtractionError('http_error', response?.status);
+        let payload;
+        try { payload = await response.json(); }
+        catch { throw new ScreenshotExtractionError('invalid_json', response.status); }
+        const text = readOcrText(payload);
+        if (!text) throw new ScreenshotExtractionError('provider_response_error', response.status);
+        recognized.push(text);
+      }
+
+      // OCR.space transcribes text; it does not reliably map text to fields.
+      // Keep the result as reviewable evidence and never infer missing values.
+      const combinedText = recognized.join('\n\n--- Screenshot ---\n\n').slice(0, 8000);
+      const fields = Object.fromEntries(fieldNames.map((name) => [name, {
+        value: name === 'description' ? combinedText : null,
+        confidence: 0,
+        sourceText: name === 'description' ? combinedText.slice(0, 1000) : null,
+        uncertain: true,
+      }]));
+      return { fields, provider: 'ocr.space' };
     },
   };
 }

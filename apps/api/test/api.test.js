@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { createApp } from '../src/app.js';
 import { openDatabase, migrateDatabase, closeDatabase } from '../src/database.js';
 import { readConfig } from '../src/config.js';
-import { createScreenshotExtractor } from '../src/screenshot-extraction.js';
+import { createScreenshotExtractor, ScreenshotExtractionError } from '../src/screenshot-extraction.js';
 import { createEmailProvider } from '../src/email.js';
 
 class ApiClient {
@@ -87,14 +87,27 @@ test('demo seed is idempotent and remains clearly fictional', (t) => {
   try{assert.equal(db.prepare('SELECT COUNT(*) count FROM jobs WHERE is_demo=1').get().count,6);assert.equal(db.prepare("SELECT COUNT(*) count FROM users WHERE email='demo-poster@referralos.example' AND disabled_at IS NOT NULL").get().count,1);assert.equal(db.prepare("SELECT COUNT(*) count FROM jobs WHERE description LIKE 'DEMO DATA — fictional example listing.%'").get().count,6);}finally{closeDatabase(db);}
 });
 
-test('screenshot OCR adapter reports provider failure and marks missing or low-confidence fields',async()=>{
-  const base={nodeEnv:'test',screenshotOcrUrl:'https://ocr.example.test/extract',screenshotOcrApiKey:'test-only',};
-  const failed=createScreenshotExtractor(base,{fetchImpl:async()=>({ok:false,status:503})});
-  await assert.rejects(()=>failed.extract([{mimeType:'image/png',buffer:Buffer.from('image')}]),/SCREENSHOT_OCR_PROVIDER_FAILED/);
-  const successful=createScreenshotExtractor(base,{fetchImpl:async()=>({ok:true,json:async()=>({fields:{title:{value:'Engineer',confidence:.99,sourceText:'Engineer'},salaryRange:{value:null,confidence:0}}})})});
-  const result=await successful.extract([{mimeType:'image/png',buffer:Buffer.from('image')}]);
-  assert.equal(result.fields.title.value,'Engineer');assert.equal(result.fields.title.uncertain,false);
-  assert.equal(result.fields.location.value,null);assert.equal(result.fields.location.uncertain,true);
+test('OCR.space adapter sends multipart requests and preserves recognized text as unverified evidence',async()=>{
+  const base={nodeEnv:'test',screenshotOcrUrl:'https://api.ocr.space/parse/image',screenshotOcrApiKey:'test-only'};
+  let request;
+  const extractor=createScreenshotExtractor(base,{fetchImpl:async(url,options)=>{request={url,options};return{ok:true,status:200,json:async()=>({OCRExitCode:1,IsErroredOnProcessing:false,ParsedResults:[{ParsedText:'Senior Engineer\\nRemote · TypeScript'}]})};}});
+  const result=await extractor.extract([{mimeType:'image/png',buffer:Buffer.from('image')}]);
+  assert.equal(String(request.url),'https://api.ocr.space/parse/image');
+  assert.equal(request.options.method,'POST');assert.equal(request.options.headers.apikey,'test-only');assert.equal(request.options.headers.authorization,undefined);
+  assert.ok(request.options.body instanceof FormData);assert.equal(request.options.body.get('language'),'eng');assert.equal(request.options.body.get('isOverlayRequired'),'false');
+  assert.equal(request.options.body.get('file').name,'screenshot.png');assert.equal(result.provider,'ocr.space');
+  assert.equal(result.fields.description.value,'Senior Engineer\\nRemote · TypeScript');assert.equal(result.fields.description.uncertain,true);assert.equal(result.fields.title.value,null);
+});
+
+test('OCR.space adapter categorizes failures without echoing provider content or credentials',async()=>{
+  const base={nodeEnv:'production',screenshotOcrUrl:'https://api.ocr.space/parse/image',screenshotOcrApiKey:'never-log-this-key'};
+  const image=[{mimeType:'image/jpeg',buffer:Buffer.from('private-image-bytes')}];
+  const failed=createScreenshotExtractor(base,{fetchImpl:async()=>({ok:false,status:503,text:async()=>'private-provider-response'})});
+  await assert.rejects(()=>failed.extract(image),(error)=>error instanceof ScreenshotExtractionError&&error.category==='http_error'&&error.httpStatus===503&&!error.message.includes('private-provider-response')&&!error.message.includes('never-log-this-key'));
+  const invalidJson=createScreenshotExtractor(base,{fetchImpl:async()=>({ok:true,status:200,json:async()=>{throw new Error('private payload');}})});
+  await assert.rejects(()=>invalidJson.extract(image),(error)=>error.category==='invalid_json'&&error.httpStatus===200&&!error.message.includes('private payload'));
+  const providerError=createScreenshotExtractor(base,{fetchImpl:async()=>({ok:true,status:200,json:async()=>({OCRExitCode:4,IsErroredOnProcessing:true,ErrorMessage:'private provider details'})})});
+  await assert.rejects(()=>providerError.extract(image),(error)=>error.category==='provider_response_error'&&!error.message.includes('private provider details'));
 });
 
 test('verification email adapter keeps previews development-only and fails closed in production',async()=>{

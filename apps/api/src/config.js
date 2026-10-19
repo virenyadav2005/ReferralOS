@@ -32,6 +32,7 @@ export function readConfig(env = process.env) {
     .split(',').map((domain) => domain.trim().toLowerCase()).filter(Boolean);
   return {
     nodeEnv: env.NODE_ENV ?? 'development',
+    demoMode: (env.DEMO_MODE ?? '').trim().toLowerCase() === 'true',
     port: Number(env.PORT ?? 4000),
     host: env.HOST ?? (env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1'),
     appOrigin: allowedOrigins[0],
