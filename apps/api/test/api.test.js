@@ -38,6 +38,11 @@ class ApiClient {
 
 test('local origin configuration is exact and supports an explicit allowlist', () => {
   assert.deepEqual(readConfig({}).allowedOrigins,['http://127.0.0.1:5173']);
+  assert.equal(readConfig({}).demoMode,false,'demo mode is off unless explicitly enabled');
+  assert.equal(readConfig({NODE_ENV:'production'}).demoMode,false,'production does not default into read-only mode');
+  assert.equal(readConfig({NODE_ENV:'production'}).emailProvider,'unconfigured','production never falls back to local console email');
+  assert.equal(readConfig({NODE_ENV:'production'}).host,'0.0.0.0','production binds to the platform interface by default');
+  assert.equal(readConfig({DEMO_MODE:'true'}).demoMode,true,'read-only mode remains available as an explicit opt-in');
   assert.deepEqual(readConfig({APP_ORIGINS:'http://127.0.0.1:5173, http://localhost:5173'}).allowedOrigins,
     ['http://127.0.0.1:5173','http://localhost:5173']);
   assert.throws(()=>readConfig({APP_ORIGINS:'*'}),/Invalid frontend origin|exact http\(s\) origins/);
@@ -87,7 +92,7 @@ test('demo seed is idempotent and remains clearly fictional', (t) => {
   try{assert.equal(db.prepare('SELECT COUNT(*) count FROM jobs WHERE is_demo=1').get().count,6);assert.equal(db.prepare("SELECT COUNT(*) count FROM users WHERE email='demo-poster@referralos.example' AND disabled_at IS NOT NULL").get().count,1);assert.equal(db.prepare("SELECT COUNT(*) count FROM jobs WHERE description LIKE 'DEMO DATA — fictional example listing.%'").get().count,6);}finally{closeDatabase(db);}
 });
 
-test('OCR.space adapter sends multipart requests and preserves recognized text as unverified evidence',async()=>{
+test('OCR.space adapter sends multipart requests and preserves raw text without inventing a description',async()=>{
   const base={nodeEnv:'test',screenshotOcrUrl:'https://api.ocr.space/parse/image',screenshotOcrApiKey:'test-only'};
   let request;
   const extractor=createScreenshotExtractor(base,{fetchImpl:async(url,options)=>{request={url,options};return{ok:true,status:200,json:async()=>({OCRExitCode:1,IsErroredOnProcessing:false,ParsedResults:[{ParsedText:'Senior Engineer\\nRemote · TypeScript'}]})};}});
@@ -96,7 +101,7 @@ test('OCR.space adapter sends multipart requests and preserves recognized text a
   assert.equal(request.options.method,'POST');assert.equal(request.options.headers.apikey,'test-only');assert.equal(request.options.headers.authorization,undefined);
   assert.ok(request.options.body instanceof FormData);assert.equal(request.options.body.get('language'),'eng');assert.equal(request.options.body.get('isOverlayRequired'),'false');
   assert.equal(request.options.body.get('file').name,'screenshot.png');assert.equal(result.provider,'ocr.space');
-  assert.equal(result.fields.description.value,'Senior Engineer\\nRemote · TypeScript');assert.equal(result.fields.description.uncertain,true);assert.equal(result.fields.title.value,null);
+  assert.equal(result.rawText,'Senior Engineer\\nRemote · TypeScript');assert.equal(result.fields.description.value,null);assert.equal(result.fields.title.value,null);
 });
 
 test('OCR.space adapter categorizes failures without echoing provider content or credentials',async()=>{
@@ -135,7 +140,7 @@ test('candidate inbox uses owned persisted requests and shared compact status st
 test('auth, access control, search, details and SQLite bookmark persistence', async (t) => {
   const directory=mkdtempSync(path.join(os.tmpdir(),'referralos-test-'));
   const filename=path.join(directory,'referralos.sqlite');
-  const config={nodeEnv:'test',port:0,appOrigin:'http://127.0.0.1:5173',allowedOrigins:['http://127.0.0.1:5173'],databasePath:filename,resumeStoragePath:path.join(directory,'resumes'),jobImportStoragePath:path.join(directory,'imports'),sessionDays:7,
+  const config={nodeEnv:'test',demoMode:false,port:0,appOrigin:'http://127.0.0.1:5173',allowedOrigins:['http://127.0.0.1:5173'],databasePath:filename,resumeStoragePath:path.join(directory,'resumes'),jobImportStoragePath:path.join(directory,'imports'),sessionDays:7,
     emailVerificationMinutes:30,emailProvider:'console',publicAppUrl:'http://127.0.0.1:5173',personalEmailDomains:['gmail.com'],companyDomainMappings:{'example employer':['example.com']}};
   const sentVerification=new Map();
   const mailer={sendWorkEmailVerification:async(message)=>{sentVerification.set(message.userId,message);return {status:'development_preview'};}};
@@ -146,6 +151,7 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
   try {
     let base=await start();
     const guest=new ApiClient(base);
+    assert.deepEqual((await guest.call('/public-config')).data,{demoMode:false},'normal authenticated workflows remain enabled when demo mode is off');
     const rejectedOrigin=await guest.call('/auth/register',{method:'POST',origin:'https://attacker.example',body:{email:'origin-blocked@example.test',password:'very-secret-password',displayName:'Origin Blocked',roles:['candidate']}});
     assert.equal(rejectedOrigin.status,403,'unlisted browser origins remain rejected');
     assert.equal(rejectedOrigin.data.error,'Request origin was not accepted.');
