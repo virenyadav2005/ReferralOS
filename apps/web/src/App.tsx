@@ -1,7 +1,7 @@
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { AuthProvider } from './auth';
 import { Shell, Protected } from './components/Shell';
-import { AboutPage, AdminDashboard, AuthPage, CandidateDashboard, CandidateInboxPage, CompaniesPage, CompanyDetailPage, ContactPage, EmployeeDashboard, HomePage, JobDetailPage, JobsPage, LegalPage, NotificationsPage, ReferralRequestPage, ScreenshotImportPage } from './Pages';
+import { AboutPage, AdminDashboard, AuthPage, CandidateDashboard, CandidateInboxPage, CompaniesPage, CompanyDetailPage, ContactPage, EmployeeDashboard, HomePage, JobDetailPage, JobsPage, LegalPage, NotificationsPage, ReferralRequestPage } from './Pages';
 
 function NotFound() {
   return <div className="page-wrap not-found"><span className="eyebrow">404 · LOST THE THREAD?</span><h1>This page isn’t here.</h1><p>The link may have changed or the listing may have expired.</p><a className="button button-primary" href="/jobs">Explore jobs</a></div>;
@@ -17,7 +17,9 @@ export default function App() {
     <Route path="about" element={<AboutPage/>}/><Route path="contact" element={<ContactPage/>}/><Route path="terms" element={<LegalPage kind="terms"/>}/><Route path="privacy" element={<LegalPage kind="privacy"/>}/>
     <Route path="dashboard" element={<Protected role="candidate"><CandidateDashboard/></Protected>}/>
     <Route path="employee" element={<Protected role="employee"><EmployeeDashboard/></Protected>}/>
+    {/* Temporarily disabled while screenshot-based job import is being fixed.
     <Route path="employee/job-imports" element={<Protected role="employee"><ScreenshotImportPage/></Protected>}/>
+    */}
     <Route path="admin" element={<Protected role="admin"><AdminDashboard/></Protected>}/>
     <Route path="*" element={<NotFound/>}/>
   </Route></Routes></AuthProvider></BrowserRouter>;
