@@ -74,6 +74,10 @@ export function loadUser(db, req) {
     FROM sessions s JOIN users u ON u.id=s.user_id JOIN profiles p ON p.user_id=u.id
     WHERE s.id_hash=? AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND u.disabled_at IS NULL`).get(hashToken(token));
   if (!row) return null;
+  // Record authenticated activity at most once per minute to keep online estimates useful
+  // without turning every API request into a SQLite write.
+  db.prepare(`UPDATE sessions SET last_seen_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE id_hash=? AND last_seen_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 minute')`).run(hashToken(token));
   const roles = db.prepare('SELECT role FROM user_roles WHERE user_id=? ORDER BY role').all(row.id).map((item) => item.role);
   return { id: row.id, email: row.email, displayName: row.display_name, headline: row.headline, location: row.location, bio: row.bio, skills: JSON.parse(row.skills_json), resumeName: row.resume_name, resumeConsent: Boolean(row.resume_consent), roles };
 }
@@ -94,6 +98,17 @@ export function requireRole(role) {
   return (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: 'Sign in to continue.' });
     if (!req.user.roles.includes(role)) return res.status(403).json({ error: 'You do not have access to this area.' });
+    next();
+  };
+}
+
+export function requireAdmin(allowedEmails = []) {
+  const allowlist = new Set(allowedEmails.map((email) => email.trim().toLowerCase()));
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Sign in to continue.' });
+    if (!req.user.roles.includes('admin') || !allowlist.has(req.user.email.toLowerCase())) {
+      return res.status(403).json({ error: 'You do not have access to this area.' });
+    }
     next();
   };
 }

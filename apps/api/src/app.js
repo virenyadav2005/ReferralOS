@@ -7,7 +7,7 @@ import path from 'node:path';
 import multer from 'multer';
 import { audit, id, notify } from './ids.js';
 import { createEmailProvider } from './email.js';
-import { attachUser, clearSessionCookie, createCsrfToken, createSession, csrfGuard, hashPassword, requireAuth, requireRole, verifyPassword } from './security.js';
+import { attachUser, clearSessionCookie, createCsrfToken, createSession, csrfGuard, hashPassword, requireAdmin, requireAuth, requireRole, verifyPassword } from './security.js';
 import { completionSchema, contactReviewSchema, contactSchema, jobImportDraftSchema, jobImportExtractSchema, jobImportImageOrderSchema, jobImportPublishSchema, jobSchema, jobStatusSchema, loginSchema, parseBody, profileSchema, referralSchema, registerSchema, reportReviewSchema, reportSchema, requestMessageSchema, resumeConsentSchema, statusSchema, verificationReviewSchema, workflowStepReviewSchema, workEmailSchema, workEmailTokenSchema } from './validation.js';
 import { createScreenshotExtractor } from './screenshot-extraction.js';
 
@@ -103,6 +103,7 @@ async function sendWorkEmailVerification({ db, config, mailer, userId, affiliati
 
 export function createApp({ db, config, mailer = createEmailProvider(config), screenshotExtractor = createScreenshotExtractor(config), webDistPath = path.resolve(process.cwd(), 'apps/web/dist') }) {
   const app = express();
+  const requireAdminAccess = requireAdmin(config.adminEmails ?? []);
   const upload = multer({
     storage: multer.diskStorage({
       destination: (_req, _file, callback) => { mkdirSync(config.resumeStoragePath, { recursive: true }); callback(null, config.resumeStoragePath); },
@@ -983,9 +984,15 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     res.json({read:true,updated:result.changes});
   });
 
-  app.get('/api/admin/dashboard', requireRole('admin'), (_req, res) => {
+  app.get('/api/admin/dashboard', requireAdminAccess, (_req, res) => {
     const stats = {
       users: db.prepare('SELECT COUNT(*) count FROM users WHERE disabled_at IS NULL').get().count,
+      usersLoggedIn: db.prepare(`SELECT COUNT(DISTINCT actor_id) count FROM audit_events WHERE action='user.signed_in' AND actor_id IS NOT NULL`).get().count,
+      loginEvents: db.prepare(`SELECT COUNT(*) count FROM audit_events WHERE action='user.signed_in'`).get().count,
+      onlineNow: db.prepare(`SELECT COUNT(DISTINCT s.user_id) count FROM sessions s JOIN users u ON u.id=s.user_id
+        WHERE u.disabled_at IS NULL AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          AND s.last_seen_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 minutes')`).get().count,
+      jobsCreated: db.prepare('SELECT COUNT(*) count FROM jobs').get().count,
       openJobs: db.prepare(`SELECT COUNT(*) count FROM jobs WHERE status='published' AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')`).get().count,
       pendingVerifications: db.prepare(`SELECT COUNT(*) count FROM verification_requests WHERE status='pending'`).get().count,
       openReports: db.prepare(`SELECT COUNT(*) count FROM job_reports WHERE status IN ('open','reviewing')`).get().count,
@@ -995,22 +1002,34 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
       JOIN profiles p ON p.user_id=u.id JOIN companies c ON c.id=a.company_id WHERE v.status='pending' ORDER BY v.created_at`).all();
     const reports = db.prepare(`SELECT r.id,r.reason,r.details,r.status,r.created_at,j.title job_title,j.id job_id,c.name company_name
       FROM job_reports r JOIN jobs j ON j.id=r.job_id JOIN companies c ON c.id=j.company_id WHERE r.status IN ('open','reviewing') ORDER BY r.created_at`).all();
+    const recentLogins = db.prepare(`SELECT e.id,e.created_at,p.display_name,u.email FROM audit_events e
+      JOIN users u ON u.id=e.actor_id JOIN profiles p ON p.user_id=u.id WHERE e.action='user.signed_in'
+      ORDER BY e.created_at DESC,e.id DESC LIMIT 20`).all();
+    const recentJobs = db.prepare(`SELECT j.id,j.title,j.status,j.created_at,c.name company_name,p.display_name poster_name,u.email poster_email,
+      (SELECT COUNT(*) FROM bookmarks b WHERE b.job_id=j.id) candidate_saves
+      FROM jobs j JOIN companies c ON c.id=j.company_id JOIN profiles p ON p.user_id=j.posted_by JOIN users u ON u.id=j.posted_by
+      ORDER BY j.created_at DESC LIMIT 30`).all();
     const activity = db.prepare('SELECT id,action,entity_type,entity_id,metadata_json,created_at FROM audit_events ORDER BY created_at DESC LIMIT 30').all().map((event) => ({ ...event, metadata: JSON.parse(event.metadata_json) }));
-    res.json({ stats, verifications, reports, activity });
+    res.json({ stats, verifications, reports, recentLogins, recentJobs, activity });
   });
 
-  app.get('/api/admin/users', requireRole('admin'), (_req, res) => {
+  app.get('/api/admin/users', requireAdminAccess, (_req, res) => {
     const users = db.prepare(`SELECT u.id,u.email,u.created_at,u.disabled_at,p.display_name,
       (SELECT group_concat(role, ',') FROM user_roles WHERE user_id=u.id) roles,
-      (SELECT group_concat(c.name, ',') FROM employee_affiliations a JOIN companies c ON c.id=a.company_id WHERE a.user_id=u.id) companies
+      (SELECT group_concat(c.name, ',') FROM employee_affiliations a JOIN companies c ON c.id=a.company_id WHERE a.user_id=u.id) companies,
+      (SELECT COUNT(*) FROM jobs j WHERE j.posted_by=u.id) jobs_created,
+      (SELECT MAX(e.created_at) FROM audit_events e WHERE e.actor_id=u.id AND e.action='user.signed_in') last_login_at,
+      (SELECT MAX(s.last_seen_at) FROM sessions s WHERE s.user_id=u.id AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')) last_seen_at,
+      EXISTS(SELECT 1 FROM sessions s WHERE s.user_id=u.id AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        AND s.last_seen_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 minutes')) online_now
       FROM users u JOIN profiles p ON p.user_id=u.id ORDER BY u.created_at DESC LIMIT 100`).all();
     res.json({ users });
   });
 
-  app.get('/api/admin/contact-messages',requireRole('admin'),(_req,res)=>{
+  app.get('/api/admin/contact-messages',requireAdminAccess,(_req,res)=>{
     res.json({messages:db.prepare(`SELECT id,name,email,topic,body,status,created_at,reviewed_at FROM contact_messages ORDER BY status='open' DESC,created_at DESC LIMIT 200`).all()});
   });
-  app.patch('/api/admin/contact-messages/:messageId',requireRole('admin'),parseBody(contactReviewSchema),(req,res)=>{
+  app.patch('/api/admin/contact-messages/:messageId',requireAdminAccess,parseBody(contactReviewSchema),(req,res)=>{
     const result=db.prepare(`UPDATE contact_messages SET status=?,reviewed_by=?,reviewed_at=CASE WHEN ?='resolved' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END WHERE id=?`)
       .run(req.validatedBody.status,req.user.id,req.validatedBody.status,req.params.messageId);
     if(!result.changes)return res.status(404).json({error:'Contact message not found.'});
@@ -1018,7 +1037,7 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     res.json({id:req.params.messageId,status:req.validatedBody.status});
   });
 
-  app.patch('/api/admin/users/:userId/status', requireRole('admin'), (req, res) => {
+  app.patch('/api/admin/users/:userId/status', requireAdminAccess, (req, res) => {
     if (typeof req.body?.disabled !== 'boolean') return res.status(400).json({ error: 'disabled must be true or false.' });
     if (req.params.userId === req.user.id && req.body.disabled) return res.status(400).json({ error: 'You cannot disable your own administrator account.' });
     const user = db.prepare('SELECT id,email FROM users WHERE id=?').get(req.params.userId);
@@ -1029,7 +1048,7 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     res.json({ id: user.id, disabled: req.body.disabled });
   });
 
-  app.patch('/api/admin/verifications/:verificationId', requireRole('admin'), parseBody(verificationReviewSchema), (req, res) => {
+  app.patch('/api/admin/verifications/:verificationId', requireAdminAccess, parseBody(verificationReviewSchema), (req, res) => {
     const verification = db.prepare(`SELECT v.id,v.affiliation_id,v.submitted_by FROM verification_requests v WHERE v.id=? AND v.status='pending'`).get(req.params.verificationId);
     if (!verification) return res.status(404).json({ error: 'Pending verification request not found.' });
     const status = req.validatedBody.status;
@@ -1046,7 +1065,7 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     res.json({ id: verification.id, status });
   });
 
-  app.patch('/api/admin/reports/:reportId', requireRole('admin'), parseBody(reportReviewSchema), (req, res) => {
+  app.patch('/api/admin/reports/:reportId', requireAdminAccess, parseBody(reportReviewSchema), (req, res) => {
     const report = db.prepare('SELECT id,job_id FROM job_reports WHERE id=?').get(req.params.reportId);
     if (!report) return res.status(404).json({ error: 'Report not found.' });
     const { status, removeJob } = req.validatedBody;

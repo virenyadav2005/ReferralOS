@@ -38,6 +38,9 @@ class ApiClient {
 
 test('local origin configuration is exact and supports an explicit allowlist', () => {
   assert.deepEqual(readConfig({}).allowedOrigins,['http://127.0.0.1:5173']);
+  assert.deepEqual(readConfig({}).adminEmails,['virenyadavn@gmail.com']);
+  assert.deepEqual(readConfig({ADMIN_EMAILS:'Admin@Example.com,other@example.com,admin@example.com'}).adminEmails,['admin@example.com','other@example.com']);
+  assert.deepEqual(readConfig({ADMIN_EMAILS:''}).adminEmails,[],'an explicit empty allowlist denies every admin account');
   assert.equal(readConfig({}).demoMode,false,'demo mode is off unless explicitly enabled');
   assert.equal(readConfig({NODE_ENV:'production'}).demoMode,false,'production does not default into read-only mode');
   assert.equal(readConfig({NODE_ENV:'production'}).emailProvider,'unconfigured','production never falls back to local console email');
@@ -142,10 +145,17 @@ test('candidate inbox uses owned persisted requests and shared compact status st
   assert.match(styles, /\.application-inbox-row/);
 });
 
+test('admin usage dashboard explains recent activity and refreshes its live estimate', () => {
+  const pages=readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../web/src/Pages.tsx'),'utf8');
+  assert.match(pages,/PEOPLE WHO HAVE SIGNED IN/);assert.match(pages,/TOTAL SUCCESSFUL SIGN-INS/);assert.match(pages,/ONLINE · ACTIVE IN 5 MIN/);
+  assert.match(pages,/Recent successful sign-ins/);assert.match(pages,/jobs_created/);assert.match(pages,/setInterval\(\(\)=>load\(true\),30000\)/);
+  assert.match(pages,/Anonymous visits are not tracked/);assert.match(pages,/Jobs, authors, and candidate saves/);assert.match(pages,/not public likes/);
+});
+
 test('auth, access control, search, details and SQLite bookmark persistence', async (t) => {
   const directory=mkdtempSync(path.join(os.tmpdir(),'referralos-test-'));
   const filename=path.join(directory,'referralos.sqlite');
-  const config={nodeEnv:'test',demoMode:false,port:0,appOrigin:'http://127.0.0.1:5173',allowedOrigins:['http://127.0.0.1:5173'],databasePath:filename,resumeStoragePath:path.join(directory,'resumes'),jobImportStoragePath:path.join(directory,'imports'),sessionDays:7,
+  const config={nodeEnv:'test',demoMode:false,port:0,appOrigin:'http://127.0.0.1:5173',allowedOrigins:['http://127.0.0.1:5173'],adminEmails:['employee@example.test'],databasePath:filename,resumeStoragePath:path.join(directory,'resumes'),jobImportStoragePath:path.join(directory,'imports'),sessionDays:7,
     emailVerificationMinutes:30,emailProvider:'console',publicAppUrl:'http://127.0.0.1:5173',personalEmailDomains:['gmail.com'],companyDomainMappings:{'example employer':['example.com']}};
   const sentVerification=new Map();
   const mailer={sendWorkEmailVerification:async(message)=>{sentVerification.set(message.userId,message);return {status:'development_preview'};}};
@@ -395,6 +405,21 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
     const logout=await validClient.call('/auth/logout',{method:'POST'});
     assert.equal(logout.status,204);
     assert.equal((await validClient.call('/auth/me')).status,401,'logout invalidates the session');
+
+    assert.equal((await candidate.call('/admin/dashboard')).status,403,'admin analytics remain protected from ordinary candidates');
+    db.prepare("INSERT INTO user_roles(user_id,role) VALUES (?,'admin')").run(employeeRegistration.data.user.id);
+    const adminClient=new ApiClient(base);assert.equal((await adminClient.call('/auth/login',{method:'POST',body:{email:'employee@example.test',password:'very-secure-password'}})).status,200);
+    const adminDashboard=await adminClient.call('/admin/dashboard');assert.equal(adminDashboard.status,200);
+    assert.ok(adminDashboard.data.stats.usersLoggedIn>=1);assert.ok(adminDashboard.data.stats.loginEvents>=1);assert.ok(adminDashboard.data.stats.onlineNow>=1);
+    assert.equal(adminDashboard.data.stats.jobsCreated,db.prepare('SELECT COUNT(*) count FROM jobs').get().count);
+    assert.ok(adminDashboard.data.recentLogins.some((item)=>item.email==='employee@example.test'));
+    assert.ok(adminDashboard.data.recentJobs.some((item)=>item.poster_email==='employee@example.test'&&item.candidate_saves>=1),'admin can inspect actual job authors and candidate bookmark counts');
+    const adminUsers=(await adminClient.call('/admin/users')).data.users;const employeeAdminRow=adminUsers.find((item)=>item.id===employeeRegistration.data.user.id);
+    assert.ok(employeeAdminRow.jobs_created>=1,'admin account table attributes published listings to the author');assert.ok(employeeAdminRow.last_login_at);
+    assert.ok(employeeAdminRow.online_now);assert.ok(employeeAdminRow.last_seen_at,'authenticated activity updates session last-seen data');
+
+    db.prepare("INSERT INTO user_roles(user_id,role) VALUES (?,'admin')").run(candidateId);
+    assert.equal((await candidate.call('/admin/dashboard')).status,403,'an admin role alone is insufficient when the account email is not allowlisted');
 
     await stop();closeDatabase(db);
     db=openDatabase(filename);migrateDatabase(db);
