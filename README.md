@@ -38,6 +38,8 @@ npm run admin:grant -- your-email@example.com
 
 The command requires the operator to confirm the exact account email in the terminal. It is a local CLI operation, not a public API route. Sign out and back in after an admin role is granted.
 
+Admin routes require both the administrator role and an email in `ADMIN_EMAILS`. The default allowlist contains `virenyadavn@gmail.com`; configure the list explicitly in production. Public registration cannot grant the role, and an allowlisted account without the database role cannot access admin routes.
+
 ## Database operations
 
 ```powershell
@@ -69,6 +71,7 @@ Tests use temporary SQLite files and Node's built-in test runner. The app itself
 | `RESUME_STORAGE_DIR` | `./data/private-resumes` | Private resume directory; production example `/data/private-resumes`, outside all web/static roots. |
 | `JOB_IMPORT_STORAGE_DIR` | `./data/private-job-imports` | Private screenshot source directory; production example `/data/private-job-imports`, outside all web/static roots. |
 | `SESSION_DAYS` | `7` | Session lifetime, clamped to 1–30 days. |
+| `ADMIN_EMAILS` | `virenyadavn@gmail.com` | Comma-separated email allowlist for admin routes. Each account must also have the admin role assigned through the protected local CLI. An explicitly empty value denies all admin access. |
 | `PERSONAL_EMAIL_DOMAINS` | Common consumer domains | Comma-separated personal email domains rejected for employee work email. |
 | `COMPANY_DOMAIN_MAPPINGS` | `{}` | Optional JSON object from company names to allowed domains, e.g. `{"Acme Ltd":["acme.example"]}`. Domain matching does not prove employment. |
 | `EMAIL_VERIFICATION_MINUTES` | `30` | Work-email token lifetime, clamped to 5–1440 minutes. |

@@ -1,6 +1,7 @@
 import path from 'node:path';
 
 const DEFAULT_APP_ORIGINS = ['http://127.0.0.1:5173'];
+const DEFAULT_ADMIN_EMAILS = ['virenyadavn@gmail.com'];
 const DEFAULT_PERSONAL_DOMAINS = ['gmail.com','googlemail.com','yahoo.com','yahoo.co.uk','outlook.com','hotmail.com','live.com','msn.com','icloud.com','me.com','aol.com','proton.me','protonmail.com','gmx.com','mail.com','yandex.com'];
 
 function readAllowedOrigins(env) {
@@ -21,6 +22,9 @@ function readAllowedOrigins(env) {
 
 export function readConfig(env = process.env) {
   const allowedOrigins = readAllowedOrigins(env);
+  const adminEmails = env.ADMIN_EMAILS === undefined
+    ? DEFAULT_ADMIN_EMAILS
+    : env.ADMIN_EMAILS.split(',').map((email) => email.trim().toLowerCase()).filter(Boolean);
   let companyDomainMappings = {};
   try { companyDomainMappings = JSON.parse(env.COMPANY_DOMAIN_MAPPINGS ?? '{}'); }
   catch { throw new Error('COMPANY_DOMAIN_MAPPINGS must be a JSON object mapping company names to domain arrays.'); }
@@ -37,6 +41,7 @@ export function readConfig(env = process.env) {
     host: env.HOST ?? (env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1'),
     appOrigin: allowedOrigins[0],
     allowedOrigins,
+    adminEmails: [...new Set(adminEmails)],
     personalEmailDomains: [...new Set(personalEmailDomains)],
     companyDomainMappings: Object.fromEntries(Object.entries(companyDomainMappings).map(([company, domains]) => [company.trim().toLowerCase(), domains.map((domain) => domain.toLowerCase())])),
     databasePath: path.resolve(process.cwd(), env.DATABASE_PATH ?? './data/referralos.sqlite'),
