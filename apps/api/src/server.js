@@ -3,6 +3,7 @@ import { existsSync, unlinkSync } from 'node:fs';
 import { createApp } from './app.js';
 import { readConfig } from './config.js';
 import { closeDatabase, migrateDatabase, openDatabase } from './database.js';
+import { dispatchPushOutbox } from './web-push.js';
 
 const config = readConfig();
 const db = openDatabase(config.databasePath);
@@ -41,11 +42,15 @@ try {
 }
 
 const app = createApp({ db, config });
+let pushDispatchActive=false;
+const dispatchPush=async()=>{if(pushDispatchActive)return;pushDispatchActive=true;try{await dispatchPushOutbox(db,config);}catch{console.error('ReferralOS browser push worker failed {category:worker_error}');}finally{pushDispatchActive=false;}};
+void dispatchPush();
+const pushTimer=setInterval(()=>void dispatchPush(),30_000);pushTimer.unref();
 const server = app.listen(config.port, config.host, () => {
   console.log(`ReferralOS API listening at ${config.host}:${config.port}`);
   console.log(`SQLite database: ${config.databasePath}`);
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => server.close(() => { clearInterval(importCleanupTimer);closeDatabase(db); process.exit(0); }));
+  process.on(signal, () => server.close(() => { clearInterval(importCleanupTimer);clearInterval(pushTimer);closeDatabase(db); process.exit(0); }));
 }

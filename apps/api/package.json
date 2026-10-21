@@ -10,6 +10,7 @@
     "express-rate-limit": "^8.1.0",
     "helmet": "^8.1.0",
     "multer": "^2.0.2",
+    "web-push": "^3.6.7",
     "zod": "^4.1.12"
   }
 }

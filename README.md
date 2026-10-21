@@ -28,7 +28,7 @@ Sample listings use reserved `.example` / `.example.test` domains and are marked
 
 ## Accounts and roles
 
-Register a candidate account, employee/referrer account, or both. A work email is optional. If supplied, it must be a non-personal address and the employee can request a single-use, time-limited verification link. Verification confirms access to that email address only; it does not establish employment or authority to represent a company. New affiliations are pending by default, but pending status does not block job publishing; an affiliation marked rejected or revoked does. Work-email verification is not a requirement for registration or job publishing. Public registration cannot assign administrator privileges. Password reset is not implemented.
+Candidates may register with a personal email. Employee/referrer registration requires a company work email and triggers a single-use, time-limited verification message. Publishing and editing jobs require proof of inbox access plus a configured company-name-to-domain mapping in `COMPANY_DOMAIN_MAPPINGS`. This confirms access to an email address and domain only; it does not establish employment or authority to represent a company. Company affiliation remains a separate state. Public registration cannot assign administrator privileges. Password reset is not implemented.
 
 For the first local administrator, register an account, then run:
 
@@ -72,8 +72,9 @@ Tests use temporary SQLite files and Node's built-in test runner. The app itself
 | `JOB_IMPORT_STORAGE_DIR` | `./data/private-job-imports` | Private screenshot source directory; production example `/data/private-job-imports`, outside all web/static roots. |
 | `SESSION_DAYS` | `7` | Session lifetime, clamped to 1–30 days. |
 | `ADMIN_EMAILS` | `virenyadavn@gmail.com` | Comma-separated email allowlist for admin routes. Each account must also have the admin role assigned through the protected local CLI. An explicitly empty value denies all admin access. |
+| `ENFORCE_VERIFIED_EMPLOYEE_EMAIL` | `true` | Require verified work-email mailbox access and a matching company-domain mapping before job create/edit/publish. May be disabled only in local/test environments; production startup rejects `false`. |
 | `PERSONAL_EMAIL_DOMAINS` | Common consumer domains | Comma-separated personal email domains rejected for employee work email. |
-| `COMPANY_DOMAIN_MAPPINGS` | `{}` | Optional JSON object from company names to allowed domains, e.g. `{"Acme Ltd":["acme.example"]}`. Domain matching does not prove employment. |
+| `COMPANY_DOMAIN_MAPPINGS` | `{}` | JSON object from exact company names to allowed domains, e.g. `{"Acme Ltd":["acme.example"]}`. Empty mapping blocks all employee publishing. Verify domain ownership using an operator-maintained trusted list; matching does not prove employment. |
 | `EMAIL_VERIFICATION_MINUTES` | `30` | Work-email token lifetime, clamped to 5–1440 minutes. |
 | `PUBLIC_APP_URL` | First `APP_ORIGINS` origin | Public app base used in verification links; configure a real domain at deployment. |
 | `EMAIL_PROVIDER` | `console` in development; unconfigured in production | Production work-email verification delivery requires `resend`. There is no production console fallback. |
@@ -81,6 +82,9 @@ Tests use temporary SQLite files and Node's built-in test runner. The app itself
 | `RESEND_API_KEY` | Unset | Resend API secret; configure only in Railway's server-side secret variables. |
 | `SCREENSHOT_OCR_URL` | Unset | Optional OCR.space endpoint. Use `https://api.ocr.space/parse/image`; production requires HTTPS. |
 | `SCREENSHOT_OCR_API_KEY` | Unset | OCR.space secret, sent only in the server-side `apikey` header. Configure as a deployment secret. |
+| `WEB_PUSH_PUBLIC_KEY` | Unset | Public VAPID key used by browser subscription. |
+| `WEB_PUSH_PRIVATE_KEY` | Unset | Private VAPID key used only by the API to send push. Store only in deployment secrets. |
+| `WEB_PUSH_SUBJECT` | Unset | VAPID contact URI, normally `mailto:you@your-domain`. Push remains disabled until all three VAPID settings are configured. |
 
 The frontend build is emitted to `apps/web/dist`. Express serves that directory and the `/api` endpoints from the same origin. The server runs SQLite migrations before it starts accepting requests. Configure and mount a persistent Railway volume at `/data` before the first production boot, then set the database and both private storage paths to `/data/...`. Without that volume, SQLite data and uploads are ephemeral and can be lost on redeploy/restart. This SQLite deployment must use one application instance; horizontal scaling is unsupported. Automated off-host backups are not configured.
 
@@ -94,9 +98,10 @@ For an optional read-only presentation, set `DEMO_MODE=true` on the server and r
 
 - Passwords use Node's scrypt implementation; sessions use opaque, hashed tokens in SQLite and HttpOnly, SameSite cookies. Production cookies are Secure.
 - Mutating API requests require a same-origin check and a double-submit CSRF token. Login and registration are rate limited. API responses do not expose full candidate profiles.
-- Resume upload accepts PDF files up to 5 MB and checks the PDF signature. Resume files are private. An employee can download a candidate's resume only after accepting that candidate's referral request and only when the candidate has enabled resume sharing.
+- Resume upload accepts PDF, DOC, and DOCX files up to 5 MB and checks file signatures. A resume explicitly attached and consented to for a referral request is private to that request and its assigned employee, who can download it while the request remains open; the candidate can revoke that request-specific access from the request page. A profile-level saved resume is shared only after the employee accepts the request and the candidate's profile sharing consent remains enabled. Access is audited.
 - Referral links, forms, email addresses, and application completion are employee-provided or user-reported. Clicking an external link never marks an application as submitted. ReferralOS does not connect to company hiring systems or submit referrals.
-- Development work-email verification previews are local-only and available to the signed-in employee. To deliver work-email verification in production, configure `EMAIL_PROVIDER=resend`, `RESEND_API_KEY`, a Resend-verified `EMAIL_FROM`, and the correct `PUBLIC_APP_URL`. If any are missing or Resend does not accept the request, the API reports that verification email was not sent; candidate registration/login and employee registration without a work email still work, and no development preview is used in production. If no provider or verified sender is configured, work-email verification delivery is unavailable. The app does not send general account-registration confirmation or password-reset email; password reset is not implemented. Work-email verification is optional and does not establish company affiliation or block publishing for a pending affiliation.
+- Development work-email verification previews are local-only and available to the signed-in employee. Production referrer publishing requires `EMAIL_PROVIDER=resend`, `RESEND_API_KEY`, a Resend-verified `EMAIL_FROM`, correct `PUBLIC_APP_URL`, and a `COMPANY_DOMAIN_MAPPINGS` entry for each employer display name. Missing email delivery or mapping blocks job publishing; there is no production fallback. Verification proves control of the email inbox only, not employment or company authorization. The app does not send general account-registration confirmation or password-reset email; password reset is not implemented.
+- Browser push notifications require an HTTPS deployment, browser permission, and `WEB_PUSH_PUBLIC_KEY`, `WEB_PUSH_PRIVATE_KEY`, and `WEB_PUSH_SUBJECT`. Generate the pair with `npx web-push generate-vapid-keys`; keep the private key only in Railway secrets. Users opt in per browser/device in Notifications. Supported push endpoints are limited to major browser push services. Push previews contain generic text only; the persistent in-app notification contains the actual update. iOS/iPadOS push requires an installed Home Screen web app on supported versions. In-app notifications remain enabled when push configuration is absent. Delivery requires the worker process in the single API instance; missed push is not a substitute for checking the in-app inbox.
 
 ## Railway production setup (manual; no deployment performed)
 

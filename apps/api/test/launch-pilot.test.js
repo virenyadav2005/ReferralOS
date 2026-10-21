@@ -59,7 +59,7 @@ test('read-only pilot preserves origin and CSRF checks while blocking registrati
     extractor: { configured: true, async extract() { extractionCalls += 1; return {}; } },
   });
   const publicConfig = await fetch(`${base}/api/public-config`);
-  assert.deepEqual(await publicConfig.json(), { demoMode: true });
+  assert.deepEqual(await publicConfig.json(), { demoMode: true, webPushPublicKey: null });
 
   db.prepare('INSERT INTO users(id,email,password_hash) VALUES (?,?,?)').run('demo-poster', 'demo-poster@example.test', 'not-a-login-hash');
   db.prepare('INSERT INTO profiles(user_id,display_name) VALUES (?,?)').run('demo-poster', 'Demo Poster');

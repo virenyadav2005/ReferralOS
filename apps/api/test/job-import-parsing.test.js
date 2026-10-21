@@ -58,7 +58,8 @@ async function createImportApi(t, extractor) {
   const filename = path.join(directory, 'test.sqlite');
   const db = openDatabase(filename);
   migrateDatabase(db);
-  const config = { ...readConfig({ NODE_ENV: 'test', APP_ORIGINS: 'http://127.0.0.1:5173' }), databasePath: filename,
+  // These tests isolate screenshot parsing/storage and do not test work-email publishing policy.
+  const config = { ...readConfig({ NODE_ENV: 'test', APP_ORIGINS: 'http://127.0.0.1:5173', ENFORCE_VERIFIED_EMPLOYEE_EMAIL: 'false' }), databasePath: filename,
     resumeStoragePath: path.join(directory, 'resumes'), jobImportStoragePath: path.join(directory, 'imports') };
   const app = createApp({ db, config, screenshotExtractor: extractor, webDistPath: path.join(directory, 'missing-web') });
   const server = await new Promise((resolve) => { const instance = app.listen(0, '127.0.0.1', () => resolve(instance)); });

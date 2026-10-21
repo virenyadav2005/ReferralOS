@@ -22,6 +22,9 @@ function readAllowedOrigins(env) {
 
 export function readConfig(env = process.env) {
   const allowedOrigins = readAllowedOrigins(env);
+  const nodeEnv=env.NODE_ENV ?? 'development';
+  const enforceVerifiedEmployeeEmail=(env.ENFORCE_VERIFIED_EMPLOYEE_EMAIL ?? 'true').trim().toLowerCase() !== 'false';
+  if(nodeEnv==='production'&&!enforceVerifiedEmployeeEmail)throw new Error('Verified employee email and company-domain mapping cannot be disabled in production.');
   const adminEmails = env.ADMIN_EMAILS === undefined
     ? DEFAULT_ADMIN_EMAILS
     : env.ADMIN_EMAILS.split(',').map((email) => email.trim().toLowerCase()).filter(Boolean);
@@ -35,13 +38,17 @@ export function readConfig(env = process.env) {
   const personalEmailDomains = (env.PERSONAL_EMAIL_DOMAINS ?? DEFAULT_PERSONAL_DOMAINS.join(','))
     .split(',').map((domain) => domain.trim().toLowerCase()).filter(Boolean);
   return {
-    nodeEnv: env.NODE_ENV ?? 'development',
+    nodeEnv,
     demoMode: (env.DEMO_MODE ?? '').trim().toLowerCase() === 'true',
     port: Number(env.PORT ?? 4000),
     host: env.HOST ?? (env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1'),
     appOrigin: allowedOrigins[0],
     allowedOrigins,
     adminEmails: [...new Set(adminEmails)],
+    enforceVerifiedEmployeeEmail,
+    webPushPublicKey: env.WEB_PUSH_PUBLIC_KEY ?? '',
+    webPushPrivateKey: env.WEB_PUSH_PRIVATE_KEY ?? '',
+    webPushSubject: env.WEB_PUSH_SUBJECT ?? '',
     personalEmailDomains: [...new Set(personalEmailDomains)],
     companyDomainMappings: Object.fromEntries(Object.entries(companyDomainMappings).map(([company, domains]) => [company.trim().toLowerCase(), domains.map((domain) => domain.toLowerCase())])),
     databasePath: path.resolve(process.cwd(), env.DATABASE_PATH ?? './data/referralos.sqlite'),

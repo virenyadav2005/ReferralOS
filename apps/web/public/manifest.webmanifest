@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "ReferralOS",
+  "short_name": "ReferralOS",
+  "description": "One Platform. Every Referral Path.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f8f9fc",
+  "theme_color": "#f8f9fc",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

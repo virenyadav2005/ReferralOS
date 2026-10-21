@@ -8,7 +8,7 @@ import multer from 'multer';
 import { audit, id, notify } from './ids.js';
 import { createEmailProvider } from './email.js';
 import { attachUser, clearSessionCookie, createCsrfToken, createSession, csrfGuard, hashPassword, requireAdmin, requireAuth, requireRole, verifyPassword } from './security.js';
-import { completionSchema, contactReviewSchema, contactSchema, jobImportDraftSchema, jobImportExtractSchema, jobImportImageOrderSchema, jobImportPublishSchema, jobSchema, jobStatusSchema, loginSchema, parseBody, profileSchema, referralSchema, registerSchema, reportReviewSchema, reportSchema, requestMessageSchema, resumeConsentSchema, statusSchema, verificationReviewSchema, workflowStepReviewSchema, workEmailSchema, workEmailTokenSchema } from './validation.js';
+import { completionSchema, contactReviewSchema, contactSchema, jobImportDraftSchema, jobImportExtractSchema, jobImportImageOrderSchema, jobImportPublishSchema, jobSchema, jobStatusSchema, loginSchema, parseBody, profileSchema, pushSubscriptionSchema, pushUnsubscribeSchema, referralSchema, registerSchema, reportReviewSchema, reportSchema, requestMessageSchema, resumeConsentSchema, statusSchema, verificationReviewSchema, workflowStepReviewSchema, workEmailSchema, workEmailTokenSchema } from './validation.js';
 import { createScreenshotExtractor } from './screenshot-extraction.js';
 
 const templateNames = {
@@ -75,6 +75,12 @@ function verifyWorkEmailEligibility(email, companyName, config) {
   const mappedDomains = config.companyDomainMappings?.[key];
   if (mappedDomains && !mappedDomains.includes(domain)) return { error: 'This work email domain does not match the configured domain for this company.' };
   return { domain };
+}
+
+function employeeCanPublishForCompany(affiliation, config) {
+  if (!affiliation?.work_email_verified_at || !affiliation.work_email_domain) return false;
+  const domains = config.companyDomainMappings?.[String(affiliation.company_name ?? '').trim().toLowerCase()];
+  return Boolean(domains?.includes(affiliation.work_email_domain.toLowerCase()));
 }
 
 async function sendWorkEmailVerification({ db, config, mailer, userId, affiliationId, email }) {
@@ -153,7 +159,7 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
       return res.status(503).json({ status: 'unavailable' });
     }
   });
-  app.get('/api/public-config', (_req, res) => res.json({ demoMode: Boolean(config.demoMode) }));
+  app.get('/api/public-config', (_req, res) => res.json({ demoMode: Boolean(config.demoMode), webPushPublicKey: config.webPushPublicKey || null }));
   app.use('/api', attachUser(db));
   app.use('/api', (req, res, next) => {
     if (!config.demoMode) return next();
@@ -187,12 +193,14 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
   app.get('/api/auth/me', (req, res) => {
     if (!req.user) return res.status(401).json({ error: 'Not signed in.' });
     const affiliations = db.prepare(`SELECT a.id,a.status,a.job_title,a.work_email,a.work_email_domain,a.work_email_verified_at,a.created_at,c.id company_id,c.name company_name
-      FROM employee_affiliations a JOIN companies c ON c.id=a.company_id WHERE a.user_id=? ORDER BY a.created_at DESC`).all(req.user.id);
+      FROM employee_affiliations a JOIN companies c ON c.id=a.company_id WHERE a.user_id=? ORDER BY a.created_at DESC`).all(req.user.id)
+      .map((affiliation)=>({...affiliation,canPublish:!config.enforceVerifiedEmployeeEmail||employeeCanPublishForCompany(affiliation,config)}));
     return res.json({ user: req.user, affiliations });
   });
 
   app.post('/api/auth/register', rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: true, legacyHeaders: false }), parseBody(registerSchema), asyncRoute(async (req, res) => {
     const body = req.validatedBody;
+    if(config.enforceVerifiedEmployeeEmail&&body.roles.includes('employee')&&!body.workEmail)return res.status(400).json({error:'A company work email is required for employee registration.'});
     let workEmailDomain = null;
     if (body.roles.includes('employee') && body.workEmail) {
       const eligibility = verifyWorkEmailEligibility(body.workEmail, body.companyName, config);
@@ -344,7 +352,10 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
       JOIN jobs j ON j.id=r.job_id JOIN profiles p ON p.user_id=r.candidate_id
       WHERE r.id=? AND r.employee_id=? AND j.posted_by=?`).get(req.params.requestId, req.user.id, req.user.id);
     if (!request) return res.status(404).json({ error: 'Referral request not found.' });
-    if (!['accepted','candidate_action_needed','employee_action_needed','candidate_reported_applied','referral_confirmed'].includes(request.status) || (request.request_storage_key ? request.request_resume_revoked || !request.request_resume_name : !request.resume_consent)) {
+    const requestAttachment = Boolean(request.request_storage_key && !request.request_resume_revoked && request.request_resume_name);
+    const requestIsOpen = !['declined','withdrawn','closed','expired'].includes(request.status);
+    const profileResumeAllowed = Boolean(request.resume_consent && ['accepted','candidate_action_needed','employee_action_needed','candidate_reported_applied','referral_confirmed'].includes(request.status));
+    if (!(requestAttachment && requestIsOpen) && !(profileResumeAllowed && !request.request_storage_key)) {
       return res.status(403).json({ error: 'The candidate has not shared a resume for this referral request.' });
     }
     if (request.request_storage_key) {
@@ -358,6 +369,23 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     if (!existsSync(file)) return res.status(404).json({ error: 'Resume file is unavailable.' });
     audit(db, req.user.id, 'resume.accessed', 'referral_request', req.params.requestId);
     res.type('application/pdf').set('X-Content-Type-Options','nosniff').download(file, request.resume_name || 'resume.pdf');
+  });
+
+  app.delete('/api/referral-requests/:requestId/resume', requireApplicant, (req,res)=>{
+    const request=db.prepare(`SELECT r.id,r.employee_id,j.title,
+      EXISTS(SELECT 1 FROM referral_request_resumes rr WHERE rr.request_id=r.id AND rr.candidate_id=r.candidate_id AND rr.revoked_at IS NULL) resume_shared
+      FROM referral_requests r JOIN jobs j ON j.id=r.job_id WHERE r.id=? AND r.candidate_id=?`).get(req.params.requestId,req.user.id);
+    if(!request)return res.status(404).json({error:'Referral request not found.'});
+    if(!request.resume_shared)return res.status(409).json({error:'There is no active request-specific resume share to revoke.'});
+    db.exec('BEGIN IMMEDIATE');
+    try{
+      const revoked=db.prepare(`UPDATE referral_request_resumes SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE request_id=? AND candidate_id=? AND revoked_at IS NULL`).run(request.id,req.user.id);
+      if(!revoked.changes){db.exec('ROLLBACK');return res.status(409).json({error:'This resume share has already been revoked.'});}
+      notify(db,request.employee_id,'resume_consent_revoked','Resume access revoked',`The candidate revoked access to the resume shared for “${request.title}”.`,`/referral-requests/${request.id}`);
+      audit(db,req.user.id,'resume.referral_share_revoked','referral_request',request.id);
+      db.exec('COMMIT');
+    }catch(error){db.exec('ROLLBACK');throw error;}
+    return res.json({revoked:true});
   });
 
   app.get('/api/jobs', (req, res) => {
@@ -571,7 +599,8 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     const draft=loadOwnedDraft(req.params.draftId,req.user.id);if(!draft||draft.status!=='reviewing'||!draft.review_confirmed_at)return res.status(409).json({error:'Save the completed review and explicitly confirm the screenshot-derived details before publishing.'});
     const reviewedData=JSON.parse(draft.draft_json);if(reviewedData.qualifications)reviewedData.description=`${reviewedData.description??''}\n\nQualifications\n${reviewedData.qualifications}`;
     const parsed=jobSchema.safeParse(reviewedData);if(!parsed.success)return res.status(400).json({error:'Complete the required job details and referral workflow before publishing.',details:parsed.error.issues.map(issue=>({field:issue.path.join('.'),message:issue.message}))});
-    const body=parsed.data;const affiliation=db.prepare(`SELECT id FROM employee_affiliations WHERE user_id=? AND company_id=? AND status NOT IN ('rejected','revoked')`).get(req.user.id,body.companyId);if(!affiliation)return res.status(403).json({error:'An active company affiliation is required to publish.'});
+    const body=parsed.data;const affiliation=db.prepare(`SELECT a.id,a.work_email_verified_at,a.work_email_domain,c.name company_name FROM employee_affiliations a JOIN companies c ON c.id=a.company_id WHERE a.user_id=? AND a.company_id=? AND a.status NOT IN ('rejected','revoked')`).get(req.user.id,body.companyId);if(!affiliation)return res.status(403).json({error:'An active company affiliation is required to publish.'});
+    if(config.enforceVerifiedEmployeeEmail&&!employeeCanPublishForCompany(affiliation,config))return res.status(403).json({error:'Verify a company work email whose domain is configured for this company before publishing.'});
     const jobId=id();db.exec('BEGIN IMMEDIATE');try{const duplicate=db.prepare(`SELECT id FROM jobs WHERE company_id=? AND lower(title)=lower(?) AND status IN ('draft','published','paused') AND expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') LIMIT 1`).get(body.companyId,body.title);if(duplicate){db.exec('ROLLBACK');return res.status(409).json({error:'A current listing with this company and title already exists.'});}
       db.prepare(`INSERT INTO jobs(id,company_id,posted_by,title,description,location,location_type,experience_level,employment_type,skills_json,salary_range,source_url,workflow_template,status,expires_at,source_type,source_import_id,source_confirmed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'published',?,'screenshot_import',?,?)`).run(jobId,body.companyId,req.user.id,body.title,body.description,body.location,body.locationType,body.experienceLevel,body.employmentType,JSON.stringify(body.skills),body.salaryRange||null,body.sourceUrl||null,body.workflowTemplate,body.expiresAt,draft.id,draft.review_confirmed_at);
       for(const step of body.steps)db.prepare(`INSERT INTO job_workflow_steps(id,job_id,step_number,title,instructions,responsible,action_type,destination_url,destination_email,requires_application_id,completion_method) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(id(),jobId,step.stepNumber,step.title,step.instructions,step.responsible,step.actionType,step.destinationUrl||null,step.destinationEmail||null,Number(step.requiresApplicationId),step.completionMethod);
@@ -625,9 +654,10 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
 
   app.post('/api/jobs', requireRole('employee'), parseBody(jobSchema), (req, res) => {
     const body = req.validatedBody;
-    const affiliation = db.prepare(`SELECT a.id FROM employee_affiliations a WHERE a.user_id=? AND a.company_id=?
+    const affiliation = db.prepare(`SELECT a.id,a.work_email_verified_at,a.work_email_domain,c.name company_name FROM employee_affiliations a JOIN companies c ON c.id=a.company_id WHERE a.user_id=? AND a.company_id=?
       AND a.status NOT IN ('rejected','revoked')`).get(req.user.id, body.companyId);
     if (!affiliation) return res.status(403).json({ error: 'An active company affiliation is required to publish.' });
+    if (config.enforceVerifiedEmployeeEmail && !employeeCanPublishForCompany(affiliation, config)) return res.status(403).json({ error: 'Verify a company work email whose domain is configured for this company before publishing.' });
     const jobId = id();
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -655,8 +685,9 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     if(!current)return res.status(404).json({error:'Listing not found.'});
     if(current.is_demo)return res.status(403).json({error:'Demo listings cannot be edited.'});
     if(Date.parse(body.expiresAt)<=Date.now())return res.status(400).json({error:'The application deadline must be in the future.'});
-    const affiliation=db.prepare(`SELECT id FROM employee_affiliations WHERE user_id=? AND company_id=? AND status NOT IN ('rejected','revoked')`).get(req.user.id,body.companyId);
+    const affiliation=db.prepare(`SELECT a.id,a.work_email_verified_at,a.work_email_domain,c.name company_name FROM employee_affiliations a JOIN companies c ON c.id=a.company_id WHERE a.user_id=? AND a.company_id=? AND a.status NOT IN ('rejected','revoked')`).get(req.user.id,body.companyId);
     if(!affiliation)return res.status(403).json({error:'An active company affiliation is required to edit this listing.'});
+    if(config.enforceVerifiedEmployeeEmail && !employeeCanPublishForCompany(affiliation,config))return res.status(403).json({error:'Verify a company work email whose domain is configured for this company before editing listings.'});
     db.exec('BEGIN IMMEDIATE');
     try{
       const duplicate=db.prepare(`SELECT id FROM jobs WHERE id<>? AND company_id=? AND lower(title)=lower(?) AND status IN ('draft','published','paused') AND expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') LIMIT 1`).get(current.id,body.companyId,body.title);
@@ -685,11 +716,11 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
         const requests=db.prepare(`SELECT id,candidate_id,status FROM referral_requests WHERE job_id=? AND status NOT IN ('declined','withdrawn','closed','expired')`).all(job.id);
         for(const request of requests){
           db.prepare(`UPDATE referral_requests SET status='closed',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(request.id);
-          db.prepare(`INSERT INTO referral_status_history(id,request_id,actor_id,from_status,to_status,note) VALUES (?,?,?,?,?,?)`).run(id(),request.id,req.user.id,request.status,'closed','The employee closed this listing.');
-          notify(db,request.candidate_id,'referral_status','Listing closed',`The listing “${job.title}” was closed by its publisher.`,`/referral-requests/${request.id}`);
+          db.prepare(`INSERT INTO referral_status_history(id,request_id,actor_id,from_status,to_status,note) VALUES (?,?,?,?,?,?)`).run(id(),request.id,req.user.id,request.status,'closed',req.validatedBody.note);
+          notify(db,request.candidate_id,'referral_status','Listing closed',`The listing “${job.title}” was closed by its publisher. Reason: ${req.validatedBody.note}`,`/referral-requests/${request.id}`);
         }
       }
-      audit(db,req.user.id,`job.${next}`,'job',job.id,{from:job.status,to:next});
+      audit(db,req.user.id,`job.${next}`,'job',job.id,{from:job.status,to:next,reason:req.validatedBody.note||null});
       db.exec('COMMIT');
     }catch(error){db.exec('ROLLBACK');throw error;}
     res.json({id:job.id,status:next});
@@ -704,7 +735,7 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     if(!result.success){if(req.file?.path&&existsSync(req.file.path))unlinkSync(req.file.path);return res.status(400).json({error:'Please review the highlighted information.',details:result.error.issues.map((issue)=>({field:issue.path.join('.'),message:issue.message}))});}
     req.validatedBody=result.data;next();
   }, (req, res) => {
-    const job = db.prepare(`SELECT j.id,j.posted_by,j.workflow_template FROM jobs j WHERE j.id=? AND ${publicJobWhere}`).get(req.params.jobId);
+    const job = db.prepare(`SELECT j.id,j.title,j.posted_by,j.workflow_template FROM jobs j WHERE j.id=? AND ${publicJobWhere}`).get(req.params.jobId);
     const removeUpload = () => { if (req.file?.path && existsSync(req.file.path)) unlinkSync(req.file.path); };
     if (!job) { removeUpload(); return res.status(404).json({ error: 'This listing is no longer available.' }); }
     const supportsRequest = job.workflow_template === 'request_employee' || db.prepare(`SELECT 1 FROM job_workflow_steps WHERE job_id=? AND action_type='request_referral'`).get(job.id);
@@ -756,7 +787,7 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
           .run(id(), requestId, req.user.id, path.basename(resumeFile.filename), path.basename(resumeFile.originalname).slice(0,120), resumeFile.mimetype);
         audit(db, req.user.id, 'resume.shared_with_referral_request', 'referral_request', requestId);
       }
-      notify(db, job.posted_by, 'referral_request', reopened ? 'Referral request reopened' : 'New referral request', `${req.user.displayName} ${reopened ? 'reopened' : 'requested'} a referral for a job you posted.`, '/employee');
+      notify(db, job.posted_by, 'referral_request', reopened ? 'Referral request reopened' : 'New referral request', `${req.user.displayName} ${reopened ? 'reopened' : 'requested'} a referral for “${job.title}”.`, `/referral-requests/${requestId}`);
       audit(db, req.user.id, reopened ? 'referral.reopened' : 'referral.requested', 'referral_request', requestId, { jobId: job.id });
       db.exec('COMMIT');
     } catch (error) {
@@ -771,6 +802,7 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
 
   app.get('/api/referral-requests/:requestId', requireAuth, (req, res) => {
     const request = db.prepare(`SELECT r.*,j.title job_title,j.id job_id,c.name company_name,
+      EXISTS(SELECT 1 FROM referral_request_resumes rr WHERE rr.request_id=r.id AND rr.candidate_id=r.candidate_id AND rr.revoked_at IS NULL) request_resume_shared,
       cp.display_name candidate_name,ep.display_name employee_name,
       (SELECT a.work_email_verified_at FROM employee_affiliations a WHERE a.user_id=r.employee_id AND a.company_id=j.company_id ORDER BY a.created_at LIMIT 1) employee_work_email_verified_at
       FROM referral_requests r JOIN jobs j ON j.id=r.job_id JOIN companies c ON c.id=j.company_id
@@ -910,10 +942,24 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
       (SELECT COUNT(*) FROM referral_requests r WHERE r.job_id=j.id AND r.status='pending') pending_requests
       FROM jobs j JOIN companies c ON c.id=j.company_id WHERE j.posted_by=? ORDER BY j.created_at DESC`).all(req.user.id);
     const requests = db.prepare(`SELECT r.id,r.status,r.created_at,r.message,r.application_id,j.title job_title,c.name company_name,
-      p.display_name candidate_name,p.resume_consent resume_shared,(SELECT COUNT(*) FROM referral_request_messages m LEFT JOIN referral_message_reads mr ON mr.message_id=m.id AND mr.user_id=? WHERE m.request_id=r.id AND m.author_id<>? AND mr.read_at IS NULL) unread_message_count
+      p.display_name candidate_name,
+      EXISTS(SELECT 1 FROM referral_request_resumes rr WHERE rr.request_id=r.id AND rr.candidate_id=r.candidate_id AND rr.revoked_at IS NULL) AS request_resume_shared,
+      p.resume_consent AS resume_shared,
+      (SELECT COUNT(*) FROM referral_request_messages m LEFT JOIN referral_message_reads mr ON mr.message_id=m.id AND mr.user_id=? WHERE m.request_id=r.id AND m.author_id<>? AND mr.read_at IS NULL) unread_message_count
       FROM referral_requests r JOIN jobs j ON j.id=r.job_id JOIN companies c ON c.id=j.company_id
       JOIN profiles p ON p.user_id=r.candidate_id WHERE r.employee_id=? ORDER BY r.updated_at DESC`).all(req.user.id,req.user.id,req.user.id);
-    res.json({ affiliations, jobs, referralRequests: requests });
+    res.json({ affiliations:affiliations.map((affiliation)=>({...affiliation,canPublish:!config.enforceVerifiedEmployeeEmail||employeeCanPublishForCompany(affiliation,config)})), jobs, referralRequests: requests });
+  });
+
+  app.get('/api/jobs/:jobId/applicants', requireRole('employee'), (req,res)=>{
+    const owned=db.prepare('SELECT id,title,company_id FROM jobs WHERE id=? AND posted_by=?').get(req.params.jobId,req.user.id);
+    if(!owned)return res.status(404).json({error:'Listing not found.'});
+    const applicants=db.prepare(`SELECT r.id,r.job_id,r.status,r.created_at,r.updated_at,r.message,r.application_id,p.display_name candidate_name,
+      EXISTS(SELECT 1 FROM referral_request_resumes rr WHERE rr.request_id=r.id AND rr.candidate_id=r.candidate_id AND rr.revoked_at IS NULL) AS request_resume_shared,
+      p.resume_consent AS resume_shared,
+      (SELECT COUNT(*) FROM referral_request_messages m LEFT JOIN referral_message_reads mr ON mr.message_id=m.id AND mr.user_id=? WHERE m.request_id=r.id AND m.author_id<>? AND mr.read_at IS NULL) unread_message_count
+      FROM referral_requests r JOIN profiles p ON p.user_id=r.candidate_id WHERE r.job_id=? ORDER BY r.created_at DESC`).all(req.user.id,req.user.id,owned.id);
+    res.json({job:{id:owned.id,title:owned.title},applicants});
   });
 
   app.get('/api/jobs/:jobId/manage', requireRole('employee'), (req,res)=>{
@@ -935,7 +981,7 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     const candidateOnly = ['candidate_reported_applied','withdrawn'];
     if ((!isEmployee && !isCandidate) || (employeeOnly.includes(next) && !isEmployee) || (candidateOnly.includes(next) && !isCandidate)) return res.status(403).json({ error: 'You cannot make that status change.' });
     const allowed = {
-      pending: ['accepted','declined','withdrawn'], accepted: ['candidate_action_needed','employee_action_needed','referral_confirmed','candidate_reported_applied','withdrawn','closed'],
+      pending: ['accepted','declined','withdrawn','closed'], accepted: ['candidate_action_needed','employee_action_needed','referral_confirmed','candidate_reported_applied','withdrawn','closed'],
       candidate_action_needed: ['withdrawn'], employee_action_needed: ['candidate_reported_applied','referral_confirmed','candidate_action_needed','closed'],
       candidate_reported_applied: ['employee_action_needed','referral_confirmed','closed'], declined: [], referral_confirmed: ['closed'], withdrawn: [], closed: [], expired: [],
     };
@@ -951,7 +997,7 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
         .run(id(), request.id, req.user.id, req.validatedBody.note);
       const recipient = req.user.id === request.employee_id ? request.candidate_id : request.employee_id;
       const labels = { pending:'awaiting employee response',accepted:'accepted by employee',declined:'declined by employee',candidate_action_needed:'candidate action required',employee_action_needed:'employee action required',referral_confirmed:'employee reported referral submission (not independently verified)',candidate_reported_applied:'candidate reported application (not independently verified)',withdrawn:'closed by candidate',closed:'closed',expired:'expired' };
-      notify(db, recipient, 'referral_status', 'Referral activity updated', `Status: ${labels[next] ?? next.replaceAll('_',' ')}.`, `/referral-requests/${request.id}`);
+      notify(db, recipient, 'referral_status', 'Referral activity updated', `Status: ${labels[next] ?? next.replaceAll('_',' ')}.${next==='closed'?` Reason: ${req.validatedBody.note}`:''}`, `/referral-requests/${request.id}`);
       audit(db, req.user.id, 'referral.status_changed', 'referral_request', request.id, { from: request.status, to: next });
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
@@ -968,6 +1014,21 @@ export function createApp({ db, config, mailer = createEmailProvider(config), sc
     res.status(201).json({ id: reportId, message: 'Report received for review.' });
   });
 
+  app.get('/api/notifications/push-key', requireAuth,(req,res)=>res.json({publicKey:config.webPushPublicKey||null,enabled:Boolean(config.webPushPublicKey&&config.webPushPrivateKey&&config.webPushSubject)}));
+  const pushSubscriptionLimiter=rateLimit({windowMs:60*60*1000,limit:20,standardHeaders:true,legacyHeaders:false,message:{error:'Too many browser notification setting changes. Try again later.'}});
+  app.post('/api/notifications/push-subscriptions',requireAuth,pushSubscriptionLimiter,parseBody(pushSubscriptionSchema),(req,res)=>{
+    if(!config.webPushPublicKey||!config.webPushPrivateKey||!config.webPushSubject)return res.status(503).json({error:'Browser push notifications are not configured yet. In-app notifications remain available.'});
+    const saved=db.prepare(`INSERT INTO web_push_subscriptions(id,user_id,endpoint,p256dh,auth) VALUES(?,?,?,?,?)
+      ON CONFLICT(endpoint) DO UPDATE SET p256dh=excluded.p256dh,auth=excluded.auth,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE web_push_subscriptions.user_id=excluded.user_id`)
+      .run(id(),req.user.id,req.validatedBody.endpoint,req.validatedBody.keys.p256dh,req.validatedBody.keys.auth);
+    if(!saved.changes)return res.status(409).json({error:'This browser notification subscription is already assigned to another account.'});
+    res.status(201).json({subscribed:true});
+  });
+  app.delete('/api/notifications/push-subscriptions',requireAuth,pushSubscriptionLimiter,parseBody(pushUnsubscribeSchema),(req,res)=>{
+    const result=db.prepare('DELETE FROM web_push_subscriptions WHERE endpoint=? AND user_id=?').run(req.validatedBody.endpoint,req.user.id);
+    res.json({unsubscribed:true,removed:Boolean(result.changes)});
+  });
   app.get('/api/notifications', requireAuth, (req, res) => {
     res.json({ notifications: db.prepare('SELECT id,type,title,body,href,read_at,created_at FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50').all(req.user.id) });
   });
