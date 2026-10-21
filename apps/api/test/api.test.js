@@ -42,9 +42,11 @@ test('local origin configuration is exact and supports an explicit allowlist', (
   assert.deepEqual(readConfig({ADMIN_EMAILS:'Admin@Example.com,other@example.com,admin@example.com'}).adminEmails,['admin@example.com','other@example.com']);
   assert.deepEqual(readConfig({ADMIN_EMAILS:''}).adminEmails,[],'an explicit empty allowlist denies every admin account');
   assert.equal(readConfig({}).demoMode,false,'demo mode is off unless explicitly enabled');
+  assert.equal(readConfig({}).enforceVerifiedEmployeeEmail,true,'employee publishing requires verified mailbox access and an explicit company-domain mapping by default');
   assert.equal(readConfig({NODE_ENV:'production'}).demoMode,false,'production does not default into read-only mode');
   assert.equal(readConfig({NODE_ENV:'production'}).emailProvider,'unconfigured','production never falls back to local console email');
   assert.equal(readConfig({NODE_ENV:'production'}).host,'0.0.0.0','production binds to the platform interface by default');
+  assert.throws(()=>readConfig({NODE_ENV:'production',ENFORCE_VERIFIED_EMPLOYEE_EMAIL:'false'}),/cannot be disabled in production/);
   assert.equal(readConfig({DEMO_MODE:'true'}).demoMode,true,'read-only mode remains available as an explicit opt-in');
   assert.deepEqual(readConfig({APP_ORIGINS:'http://127.0.0.1:5173, http://localhost:5173'}).allowedOrigins,
     ['http://127.0.0.1:5173','http://localhost:5173']);
@@ -131,18 +133,48 @@ test('verification email adapter keeps previews development-only and fails close
   await assert.rejects(()=>production.sendWorkEmailVerification({userId:'prod-user',to:'employee@company.example',link:'https://app.example/verify-work-email?token=x',expiresAt:new Date().toISOString()}),/not configured/);
 });
 
-test('candidate inbox uses owned persisted requests and shared compact status styling without work-email prompts', () => {
+test('candidate inbox, work-email verification, and compact status styling are present in the user interface', () => {
   const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../web/src');
   const pages = readFileSync(path.join(webRoot, 'Pages.tsx'), 'utf8');
   const app = readFileSync(path.join(webRoot, 'App.tsx'), 'utf8');
   const styles = readFileSync(path.join(webRoot, 'styles.css'), 'utf8');
-  assert.doesNotMatch(pages, /WorkEmailVerificationPanel|Verify Work Email|Company work email|work-email verification records|<h2>Email verification<\/h2>/i);
-  assert.doesNotMatch(app, /verify-work-email/);
+  const manifest = readFileSync(path.join(webRoot, '../public/manifest.webmanifest'), 'utf8');
+  const serviceWorker = readFileSync(path.join(webRoot, '../public/sw.js'), 'utf8');
+  assert.match(pages, /Company work email/);
+  assert.match(pages, /WorkEmailVerificationPage/);
+  assert.match(app, /path="verify-work-email"/);
   assert.match(pages, /CandidateInboxPage/);
   assert.match(pages, /application\.status/);
   assert.match(pages, /api<\{applications:CandidateApplication\[\]\}>\('\/candidate\/applications'\)/);
   assert.match(styles, /\.status-pill\{[^}]*align-items:center[^}]*align-self:center[^}]*line-height:1\.2[^}]*white-space:nowrap/);
   assert.match(styles, /\.application-inbox-row/);
+  assert.match(manifest,/"display":\s*"standalone"/);
+  assert.match(serviceWorker,/notificationclick/);
+});
+
+test('verified mapped work email gates employee publishing without blocking account registration', async (t) => {
+  const directory=mkdtempSync(path.join(os.tmpdir(),'referralos-work-email-'));
+  const filename=path.join(directory,'work-email.sqlite');const db=openDatabase(filename);migrateDatabase(db);
+  const config={nodeEnv:'test',demoMode:false,port:0,appOrigin:'http://127.0.0.1:5173',allowedOrigins:['http://127.0.0.1:5173'],adminEmails:[],databasePath:filename,resumeStoragePath:path.join(directory,'resumes'),jobImportStoragePath:path.join(directory,'imports'),sessionDays:7,emailVerificationMinutes:30,emailProvider:'console',publicAppUrl:'http://127.0.0.1:5173',personalEmailDomains:['gmail.com'],companyDomainMappings:{'mapped employer':['mapped.example']},enforceVerifiedEmployeeEmail:true,webPushPublicKey:'B'.repeat(80),webPushPrivateKey:'test-private-key',webPushSubject:'mailto:ops@example.test'};
+  const mail=new Map();const mailer={sendWorkEmailVerification:async(message)=>{mail.set(message.userId,message);return{status:'development_preview'};}};
+  let server;server=createApp({db,config,mailer,webDistPath:path.join(directory,'no-web')}).listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));t.after(async()=>{server.closeAllConnections?.();await new Promise(resolve=>server.close(resolve));closeDatabase(db);rmSync(directory,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${server.address().port}`;const user=new ApiClient(base);
+  assert.equal((await user.call('/auth/register',{method:'POST',body:{email:'missing-work@example.test',password:'very-secure-password',displayName:'Missing Work',roles:['employee'],companyName:'Mapped Employer',jobTitle:'Engineer'}})).status,400,'employee registration requires a work email when the policy is enabled');
+  assert.equal((await user.call('/auth/register',{method:'POST',body:{email:'wrong-domain@example.test',password:'very-secure-password',displayName:'Wrong Domain',roles:['employee'],companyName:'Mapped Employer',jobTitle:'Engineer',workEmail:'person@other.example'}})).status,400,'a configured company mapping rejects unrelated domains');
+  const registration=await user.call('/auth/register',{method:'POST',body:{email:'mapped-employee@example.test',password:'very-secure-password',displayName:'Mapped Employee',roles:['employee'],companyName:'Mapped Employer',jobTitle:'Engineer',workEmail:'person@mapped.example'}});
+  assert.equal(registration.status,201);const affiliation=db.prepare('SELECT id,company_id FROM employee_affiliations WHERE user_id=?').get(registration.data.user.id);
+  const job={companyId:affiliation.company_id,title:'Mapped Employer Engineer',description:'A sufficiently detailed test job description for a mapped employer listing.',location:'Remote',locationType:'remote',experienceLevel:'mid',employmentType:'full_time',skills:['Testing'],salaryRange:'',sourceUrl:'',workflowTemplate:'request_employee',expiresAt:new Date(Date.now()+86400000).toISOString(),steps:[{stepNumber:1,title:'Request referral',instructions:'Send the employee a short note.',responsible:'candidate',actionType:'request_referral',destinationUrl:'',destinationEmail:'',requiresApplicationId:false,completionMethod:'manual_employee'}]};
+  assert.equal((await user.call('/jobs',{method:'POST',body:job})).status,403,'mailbox verification is required before publishing');
+  const token=new URL(mail.get(registration.data.user.id).link).searchParams.get('token');assert.ok(token);
+  assert.equal((await user.call('/auth/work-email/verify',{method:'POST',body:{token}})).status,200);
+  assert.equal((await user.call('/jobs',{method:'POST',body:job})).status,201,'verified mailbox plus exact company-domain mapping enables publishing');
+  const publicConfig=(await user.call('/public-config')).data;assert.equal(publicConfig.webPushPublicKey,config.webPushPublicKey,'only the public VAPID key is exposed');
+  const sub={endpoint:'https://fcm.googleapis.com/fcm/send/test-endpoint',keys:{p256dh:'p'.repeat(65),auth:'a'.repeat(24)}};
+  assert.equal((await user.call('/notifications/push-subscriptions',{method:'POST',body:sub})).status,201);
+  const unauthorized=new ApiClient(base);assert.equal((await unauthorized.call('/notifications/push-subscriptions',{method:'POST',body:sub})).status,401);
+  const other=new ApiClient(base);assert.equal((await other.call('/auth/register',{method:'POST',body:{email:'push-other@example.test',password:'very-secure-password',displayName:'Push Other',roles:['candidate']}})).status,201);
+  assert.equal((await other.call('/notifications/push-subscriptions',{method:'POST',body:sub})).status,409,'another account cannot claim an existing browser endpoint');
+  assert.equal((await user.call('/notifications/push-subscriptions',{method:'POST',body:{...sub,endpoint:'https://127.0.0.1/private'}})).status,400,'push subscriptions cannot target arbitrary HTTPS hosts');
 });
 
 test('admin usage dashboard explains recent activity and refreshes its live estimate', () => {
@@ -156,17 +188,17 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
   const directory=mkdtempSync(path.join(os.tmpdir(),'referralos-test-'));
   const filename=path.join(directory,'referralos.sqlite');
   const config={nodeEnv:'test',demoMode:false,port:0,appOrigin:'http://127.0.0.1:5173',allowedOrigins:['http://127.0.0.1:5173'],adminEmails:['employee@example.test'],databasePath:filename,resumeStoragePath:path.join(directory,'resumes'),jobImportStoragePath:path.join(directory,'imports'),sessionDays:7,
-    emailVerificationMinutes:30,emailProvider:'console',publicAppUrl:'http://127.0.0.1:5173',personalEmailDomains:['gmail.com'],companyDomainMappings:{'example employer':['example.com']}};
+    emailVerificationMinutes:30,emailProvider:'console',publicAppUrl:'http://127.0.0.1:5173',personalEmailDomains:['gmail.com'],companyDomainMappings:{'example employer':['example.com']},enforceVerifiedEmployeeEmail:true};
   const sentVerification=new Map();
   const mailer={sendWorkEmailVerification:async(message)=>{sentVerification.set(message.userId,message);return {status:'development_preview'};}};
   let db=openDatabase(filename);migrateDatabase(db);
   let server;
   const start=()=>new Promise((resolve)=>{server=createApp({db,config,mailer,webDistPath:path.join(directory,'no-web')}).listen(0,'127.0.0.1',()=>resolve(`http://127.0.0.1:${server.address().port}`));});
-  const stop=()=>new Promise((resolve)=>server.close(resolve));
+  const stop=()=>new Promise((resolve)=>{server.closeAllConnections?.();server.close(resolve);});
   try {
     let base=await start();
     const guest=new ApiClient(base);
-    assert.deepEqual((await guest.call('/public-config')).data,{demoMode:false},'normal authenticated workflows remain enabled when demo mode is off');
+    assert.deepEqual((await guest.call('/public-config')).data,{demoMode:false,webPushPublicKey:null},'normal authenticated workflows remain enabled when demo mode is off');
     const rejectedOrigin=await guest.call('/auth/register',{method:'POST',origin:'https://attacker.example',body:{email:'origin-blocked@example.test',password:'very-secret-password',displayName:'Origin Blocked',roles:['candidate']}});
     assert.equal(rejectedOrigin.status,403,'unlisted browser origins remain rejected');
     assert.equal(rejectedOrigin.data.error,'Request origin was not accepted.');
@@ -194,11 +226,15 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
     assert.equal((await employee.call('/auth/me')).status,200,'employee registration session persists across requests');
     assert.equal(db.prepare("SELECT status FROM employee_affiliations WHERE user_id=?").get(employeeRegistration.data.user.id).status,'pending');
     const employeeAffiliation=db.prepare('SELECT id,company_id FROM employee_affiliations WHERE user_id=?').get(employeeRegistration.data.user.id);
+    const employeeToken=new URL(sentVerification.get(employeeRegistration.data.user.id).link).searchParams.get('token');
+    assert.equal((await employee.call('/auth/work-email/verify',{method:'POST',body:{token:employeeToken}})).status,200,'work email is verified through its single-use token');
     const referrerWithoutWorkEmail=new ApiClient(base);
-    const unverifiedReferrer=await referrerWithoutWorkEmail.call('/auth/register',{method:'POST',body:{email:'referrer-without-work-email@example.test',password:'very-secure-password',displayName:'Riley Referrer',roles:['employee'],companyName:'Example Employer',jobTitle:'Engineer'}});
-    assert.equal(unverifiedReferrer.status,201,`referrer registration does not require a work email: ${JSON.stringify(unverifiedReferrer.data)}`);
-    assert.equal(unverifiedReferrer.data.emailVerification,undefined);
-    assert.equal(db.prepare('SELECT work_email FROM employee_affiliations WHERE user_id=?').get(unverifiedReferrer.data.user.id).work_email,null);
+    const unverifiedReferrer=await referrerWithoutWorkEmail.call('/auth/register',{method:'POST',body:{email:'referrer-with-work-email@example.test',password:'very-secure-password',displayName:'Riley Referrer',roles:['employee'],companyName:'Example Employer',jobTitle:'Engineer',workEmail:'riley@example.com'}});
+    assert.equal(unverifiedReferrer.status,201,`employee account creation accepts a matching work mailbox: ${JSON.stringify(unverifiedReferrer.data)}`);
+    assert.equal(unverifiedReferrer.data.emailVerification.status,'development_preview');
+    const rileyToken=new URL(sentVerification.get(unverifiedReferrer.data.user.id).link).searchParams.get('token');
+    assert.equal((await referrerWithoutWorkEmail.call('/auth/work-email/verify',{method:'POST',body:{token:rileyToken}})).status,200);
+    assert.equal(db.prepare('SELECT work_email FROM employee_affiliations WHERE user_id=?').get(unverifiedReferrer.data.user.id).work_email,'riley@example.com');
     const screenshot=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6e8AAAAASUVORK5CYII=','base64');
     const invalidImage=new FormData();invalidImage.set('authorizedToShare','true');invalidImage.append('screenshots',new Blob(['not an image'],{type:'image/png'}),'bad.png');
     assert.equal((await employee.call('/employee/job-imports',{method:'POST',body:invalidImage})).status,400,'spoofed image types are rejected');
@@ -211,7 +247,7 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
     const importJob={companyId:employeeAffiliation.company_id,title:'Screenshot Draft Engineer',description:'This job description was reviewed and entered from an authorized screenshot by an employee.',location:'Remote',locationType:'remote',experienceLevel:'mid',employmentType:'full_time',skills:['TypeScript'],salaryRange:'',sourceUrl:'',workflowTemplate:'request_employee',expiresAt:new Date(Date.now()+86400000).toISOString(),steps:[{stepNumber:1,title:'Request referral',instructions:'Ask the employee to consider this referral.',responsible:'candidate',actionType:'request_referral',destinationUrl:'',destinationEmail:'',requiresApplicationId:false,completionMethod:'manual_employee'}]};
     assert.equal((await employee.call(`/employee/job-imports/${importId}/publish`,{method:'POST',body:{confirmReviewed:true}})).status,409,'cannot publish without a saved review');
     assert.equal((await employee.call(`/employee/job-imports/${importId}`,{method:'PATCH',body:{draft:importJob,reviewConfirmed:true}})).status,200);
-    const publishedImport=await employee.call(`/employee/job-imports/${importId}/publish`,{method:'POST',body:{confirmReviewed:true}});assert.equal(publishedImport.status,201,'employees can publish without work-email verification');
+    const publishedImport=await employee.call(`/employee/job-imports/${importId}/publish`,{method:'POST',body:{confirmReviewed:true}});assert.equal(publishedImport.status,201,'verified and mapped employees can publish reviewed screenshot drafts');
     assert.equal((await candidate.call(`/jobs/${publishedImport.data.id}`)).data.job.sourceType,'screenshot_import','published import records its provenance');
     const jobPayload={companyId:employeeAffiliation.company_id,title:'Senior Product Engineer',description:'Fictional position used to exercise job search and referral workflow APIs.',location:'Remote',locationType:'remote',experienceLevel:'mid',employmentType:'full_time',skills:['TypeScript'],salaryRange:'',sourceUrl:'',workflowTemplate:'request_employee',expiresAt:new Date(Date.now()+86400000).toISOString(),steps:[
       {stepNumber:1,title:'Request a referral',instructions:'Send the employee a brief note about your interest in the role.',responsible:'candidate',actionType:'request_referral',destinationUrl:'',destinationEmail:'',requiresApplicationId:false,completionMethod:'manual_employee'},
@@ -225,7 +261,7 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
     assert.ok(invalidWorkflowJob.data.details.some((item)=>item.field==='steps.1.destinationUrl'));
     const referrerJobPayload={...jobPayload,title:'Another Referrer Published Role'};
     const referrerJob=await referrerWithoutWorkEmail.call('/jobs',{method:'POST',body:referrerJobPayload});
-    assert.equal(referrerJob.status,201,'referrer without work-email verification can publish a job');
+    assert.equal(referrerJob.status,201,'verified employees with a matching company-domain mapping can publish jobs');
     const ownJobDetail=await referrerWithoutWorkEmail.call(`/jobs/${referrerJob.data.id}`);
     assert.equal(ownJobDetail.data.isOwnJob,true,'job detail identifies ownership for the signed-in user');
     assert.equal((await referrerWithoutWorkEmail.call(`/jobs/${referrerJob.data.id}/referral-requests`,{method:'POST',body:{message:'I want to apply to my own listing.'}})).status,403,'the API prevents referrers from requesting on their own listing');
@@ -240,10 +276,7 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
     const docxDownload=await referrerWithoutWorkEmail.call(`/referral-requests/${referrerToReferrer.data.id}/resume`);assert.equal(docxDownload.status,200);assert.equal(docxDownload.response.headers.get('content-type'),'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
     const docApplication=new FormData();docApplication.set('message','Candidate application with a DOC.');docApplication.set('resumeConsent','true');docApplication.set('resume',new Blob([Buffer.from([0xd0,0xcf,0x11,0xe0,0xa1,0xb1,0x1a,0xe1])],{type:'application/msword'}),'application.doc');
     assert.equal((await candidate.call(`/jobs/${referrerJob.data.id}/referral-requests`,{method:'POST',body:docApplication})).status,201,'legacy DOC resumes are accepted for candidate applications');
-    const unverifiedJob=await employee.call('/jobs',{method:'POST',body:jobPayload});assert.equal(unverifiedJob.status,201,'employees can publish before optional work-email verification');
-    const employeeToken=new URL(sentVerification.get(employeeRegistration.data.user.id).link).searchParams.get('token');
-    const verified=await employee.call('/auth/work-email/verify',{method:'POST',body:{token:employeeToken}});
-    assert.equal(verified.status,200);assert.equal(verified.data.verified,true);
+    const unverifiedJob=await employee.call('/jobs',{method:'POST',body:jobPayload});assert.equal(unverifiedJob.status,201,'verified employees can publish after mailbox verification and domain mapping');
     const discardForm=new FormData();discardForm.set('authorizedToShare','true');discardForm.append('screenshots',new Blob([screenshot],{type:'image/png'}),'discard.png');
     const disposable=await employee.call('/employee/job-imports',{method:'POST',body:discardForm});assert.equal(disposable.status,201);
     assert.equal((await employee.call(`/employee/job-imports/${disposable.data.id}`,{method:'DELETE'})).data.discarded,true);
@@ -259,6 +292,12 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
     const referrerRequest=await referrerWithoutWorkEmail.call(`/jobs/${jobId}/referral-requests`,{method:'POST',body:referrerResumeForm});
     assert.equal(referrerRequest.status,201,`referrer may apply to another employee's job with a private resume: ${JSON.stringify(referrerRequest.data)}`);
     const requestResumeId=referrerRequest.data.id;
+    const applicantList=await employee.call(`/jobs/${jobId}/applicants`);
+    assert.equal(applicantList.status,200);assert.equal(applicantList.data.applicants[0].request_resume_shared,1,'the job owner sees the consented request-specific resume indicator');
+    assert.equal((await employee.call(`/referral-requests/${requestResumeId}/resume`)).status,200,'the job owner can download an explicitly attached resume while the request awaits review');
+    assert.equal((await referrerWithoutWorkEmail.call(`/jobs/${jobId}/applicants`)).status,404,'another employee cannot inspect job applicants');
+    const requestNotification=(await employee.call('/notifications')).data.notifications.find(item=>item.type==='referral_request'&&item.href===`/referral-requests/${requestResumeId}`);
+    assert.ok(requestNotification,'referral notification links to the exact candidate request');assert.match(requestNotification.body,/Senior Product Engineer/);
     assert.equal((await referrerWithoutWorkEmail.call(`/jobs/${jobId}/referral-requests`,{method:'POST',body:{message:'Duplicate request.'}})).status,409,'duplicate referrer applications are rejected');
     assert.equal(db.prepare('SELECT candidate_id,original_name FROM referral_request_resumes WHERE request_id=?').get(requestResumeId).candidate_id,unverifiedReferrer.data.user.id);
     assert.equal((await employee.call(`/jobs/${jobId}`)).data.isOwnJob,true,'the job detail UI receives the signed-in owner flag');
@@ -268,6 +307,11 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
     const attachedResume=await employee.call(`/referral-requests/${requestResumeId}/resume`);
     assert.equal(attachedResume.status,200,'the assigned employee can access the consented request attachment after accepting');
     assert.equal(attachedResume.response.headers.get('content-type'),'application/pdf');
+    assert.deepEqual((await referrerWithoutWorkEmail.call(`/referral-requests/${requestResumeId}/resume`,{method:'DELETE'})).data,{revoked:true},'the applicant can revoke request-specific resume access');
+    assert.equal((await employee.call(`/referral-requests/${requestResumeId}/resume`)).status,403,'revocation immediately blocks further employee downloads');
+    assert.equal((await employee.call(`/jobs/${jobId}/applicants`)).data.applicants.find(item=>item.id===requestResumeId).request_resume_shared,0,'the applicant list reflects revoked resume consent');
+    assert.equal((await employee.call(`/referral-requests/${requestResumeId}/status`,{method:'PATCH',body:{status:'closed',note:'The role has been filled.'}})).status,200,'the employee can close an open request with a reason');
+    assert.equal(db.prepare("SELECT note FROM referral_status_history WHERE request_id=? AND to_status='closed' ORDER BY created_at DESC LIMIT 1").get(requestResumeId).note,'The role has been filled.');
     const otherCompanyId='11111111-1111-4111-8111-111111111111';
     db.prepare('INSERT INTO companies(id,name,slug) VALUES (?,?,?)').run(otherCompanyId,'Unrelated Test Company','unrelated-test-company');
     db.prepare(`INSERT INTO jobs(id,company_id,posted_by,title,description,location,location_type,experience_level,employment_type,workflow_template,status,expires_at) VALUES(?,?,?,?,?,'Remote','remote','mid','full_time','custom','published',?)`).run('22222222-2222-4222-8222-222222222222',otherCompanyId,employeeRegistration.data.user.id,'Product Analyst','An unrelated test role used to confirm company-scoped search.','2099-01-01T00:00:00.000Z');
@@ -300,6 +344,7 @@ test('auth, access control, search, details and SQLite bookmark persistence', as
     assert.equal((await candidate.call('/profile/resume-consent',{method:'PATCH',body:{consent:true}})).data.consent,true);
     const requested=await candidate.call(`/jobs/${jobId}/referral-requests`,{method:'POST',body:{message:'I am interested in this role.'}});
     assert.equal(requested.status,201);const requestId=requested.data.id;
+    assert.equal((await employee.call(`/referral-requests/${requestId}/status`,{method:'PATCH',body:{status:'closed'}})).status,400,'closing a request without a reason is rejected');
     const inboxAfterRequest=await candidate.call('/candidate/applications');
     assert.ok(inboxAfterRequest.data.applications.some((item)=>item.id===requestId&&item.status==='pending'&&item.kind==='referral_request'),'candidate inbox shows the signed-in user’s current request status');
     assert.equal((await guest.call('/candidate/applications')).status,401,'candidate inbox requires authentication');
